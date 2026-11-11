@@ -25,15 +25,15 @@ Part-time pacing, about 12 weeks to a demoable project. Each phase ends with som
 
 ## Phase 2: Flow core, no cluster (weeks 4-5)
 
-- ⬜ `pkg/schema`: parse and validate flows, resolve `${...}` references, errors with line numbers
-- ⬜ `pkg/graph`: DAG, topological sort, cycle detection
-- ⬜ Node registry, `image-ref` action, a fake resource node
-- ⬜ Executor with `errgroup`: parallel scheduling, halt on failure, context cancellation
-- ⬜ Action cache: canonical hashing and invalidation
-- ⬜ Plan model and renderer
-- ⬜ In-memory fake driver so the whole loop runs without Docker or a cluster
+- ✅ `pkg/schema`: parse and validate flows, resolve `${...}` references, errors with line numbers
+- ✅ `pkg/graph`: DAG, topological sort, cycle detection
+- ✅ Node registry, `image-ref` action, `fake-object` resource node
+- ✅ Executor with `errgroup`: parallel scheduling, halt on failure, context cancellation
+- ✅ Action cache: canonical hashing and invalidation (disk-backed, atomic writes)
+- ✅ Plan model and renderer (`will-run`/`cached`, `create`/`update`/`none`/`known-after-apply`)
+- ✅ In-memory fake driver (`.afon/fake-state.json` for the CLI) so the whole loop runs without Docker or a cluster
 
-**Done when:** `validate`, `plan`, and `apply` work end to end against the fake driver, a failed node leaves consistent state, and the graph, executor, and cache logic have strong tests.
+**Done when:** `validate`, `plan`, and `apply` work end to end against the fake driver, a failed node leaves consistent state, and the graph, executor, and cache logic have strong tests. **Met** — all green under `go test -race ./...`, including the cross-process apply-twice-then-plan e2e.
 
 ## Phase 3: Kubernetes driver (weeks 6-7)
 

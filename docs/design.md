@@ -1,6 +1,6 @@
 # Afon design doc
 
-Status: draft v1 · Scope: the thin slice (prebuilt image → plan → apply → wait → release → rollback)
+Status: draft v2 · Scope: the thin slice (prebuilt image → plan → apply → wait → release → rollback)
 
 Afon is a remote, cluster-aware delivery pipeline for Kubernetes and k3s. This document fixes four decisions the engine depends on: how nodes behave (action vs. resource), what the cluster profile contains, what a release record stores, and what a flow file looks like. Anything not covered here is out of scope for v1.
 
@@ -21,10 +21,11 @@ Every node in a flow is one of two kinds. The kind belongs to the **node type**,
 **Cache key for actions:**
 
 ```
-key = sha256(canonicalJSON{ type, typeVersion, resolvedConfig, upstreamOutputs })
+key = sha256(canonicalJSON{ type, typeVersion, resolvedConfig })
 ```
 
-- Canonical JSON (sorted keys, no whitespace), or equal inputs hash differently between runs.
+- Canonical JSON (sorted keys, no whitespace, numbers normalized so `1` and `1.0` hash alike), or equal inputs hash differently between runs.
+- `resolvedConfig` has all `${...}` references substituted with their resolved values, so upstream outputs enter the key only through what this node actually references (rule 3 below).
 - `typeVersion` is included so a change to a node's code invalidates its cache.
 - A cache hit is **verified**, not trusted. A recorded image digest is only valid if the registry still has it.
 - Scans carry a time or database dimension (Trivy DB version, or a 24h TTL). An unchanged image can gain new CVEs, so a cached "clean" result must expire.
@@ -33,6 +34,41 @@ key = sha256(canonicalJSON{ type, typeVersion, resolvedConfig, upstreamOutputs }
 **Outputs feed resources.** `image-build` outputs a digest, and the manifests consume it. Deploys are by digest, never by tag, so a rollback restores exactly what ran before.
 
 **Execution:** nodes whose dependencies are complete run in parallel (`errgroup`). On a failure the executor stops scheduling, lets in-flight nodes finish or cancel, and records exactly what succeeded. No release is marked `deployed` unless the flow completed.
+
+**Node interfaces (implemented in `pkg/engine`).** The kind belongs to the type, so the contract splits:
+
+```go
+type Base interface {
+    Type() string; TypeVersion() string; Kind() Kind
+    Validate(cfg Config) error
+    DeclaredOutputs() []string
+}
+type ActionType  interface { Base; Run(ctx, cfg Config, in Inputs) (Outputs, error) }
+type ResourceType interface { Base; Desired(ctx, cfg Config, in Inputs) ([]driver.Object, error) }
+```
+
+Only `ActionType.Run` has side effects. The engine owns the cache check (compute key, ask the store, mark `cached` or call `Run`) and owns every driver call (`Desired` only declares what should exist). Plan is read-only by construction: it never calls `Run`.
+
+### Phase 2 engine rules
+
+These are settled decisions; each exists to stop a later accident.
+
+1. **`will-run` at plan time is an upper bound.** If an action's inputs were unknown during planning, its key is computed at apply time and may hit the cache then. Apply reports what actually happened (`NodeResult.Cached`). A plan can predict more work than the apply performs, never less.
+2. **Unknown poisons the whole value and the whole node, not a field.** Interpolating an Unknown into a longer string makes that string Unknown. A resource node with any Unknown value anywhere in its config is `known-after-apply`. Less precise than Terraform, but simple and correct.
+3. **Hash only what the node references.** The key is `sha256(canonicalJSON{type, typeVersion, resolvedConfig})` — `resolvedConfig` already embeds referenced upstream values. Hashing all of `upstreamOutputs` would let a `needs`-only edge or an unrelated output invalidate the cache for no reason.
+4. **Cache writes happen only after a successful `Run`.** A failed action never leaves an entry behind.
+5. **`validate` means schema plus Compile.** Types, declared outputs, and cycles only surface in Compile, so `afon validate` runs it with the registry populated explicitly in `cmd`. It never touches a driver.
+6. **The fake driver has its own mutex; `Apply` is atomic per call.** Parallel resource nodes call it concurrently: build the new state in memory, write the file once with temp-and-rename. A failure midway leaves the old file untouched. Two processes running at once are still unprotected — a known gap until file locking exists.
+7. **`Object.Data` is normalized exactly like hashing input.** Diffs compare canonical forms, so `1` vs `1.0` and map ordering can never produce phantom updates.
+
+### Reference grammar (`${...}`)
+
+- Node IDs and output names exclude dots, so `${a.b}` is unambiguous: `a` is the node, `b` is the output.
+- A **whole-string** reference (`${image.ref}` as the entire scalar) keeps the referenced value's type — object, number, bool.
+- **Interpolation** inside a longer string (`"repo/${src.sha}"`) always yields a string.
+- References nest inside maps and lists; each one adds a DAG edge.
+- `$${` escapes a literal `${`.
+- `${secret.NAME}` and `${env.NAME}` parse, but a node that needs one is an error in Phase 2 (resolved at apply time, Phase 3+).
 
 ## 2. ClusterProfile schema (`afon.dev/probe/v1`)
 

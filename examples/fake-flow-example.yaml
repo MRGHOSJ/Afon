@@ -1,0 +1,17 @@
+apiVersion: afon.dev/flow/v1
+kind: Flow
+metadata:
+  name: demo
+spec:
+  nodes:
+    - id: image
+      type: image-ref
+      config:
+        ref: nginx:1.27
+    - id: obj
+      type: fake-object
+      config:
+        kind: ConfigMap
+        name: hello
+        data:
+          digest: ${image.digest}

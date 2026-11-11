@@ -30,3 +30,6 @@ vendor/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Afon state dir (cache + fake driver state)
+.afon/

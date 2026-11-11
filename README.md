@@ -4,7 +4,7 @@
 
 Afon connects to an existing cluster, maps its active infrastructure, and runs an end-to-end delivery pipeline from git to a verified running deployment. Instead of rewriting or replacing your favorite infrastructure utilities, Afon provides a unified framework to drop in third-party tooling—such as security scanners, build engines, and GitOps agents—driven by a local CLI and visualized inside an interactive web control plane.
 
-> **Status: early, learning project.** Only the local `inspect` command exists today. The plugin runtime, DAG compiler, and visual web control plane are currently in active design and roadmap phases. See [Status](#status) for details.
+> **Status: early, learning project.** The local `inspect` command and the Phase 2 flow engine (`validate` / `plan` / `apply` against a fake driver) exist today. The Kubernetes driver, release records, and visual web control plane are still on the roadmap. See [Status](#status) for details.
 
 ---
 
@@ -26,7 +26,7 @@ The project explores a highly distinct philosophy meant to combat DevOps toolcha
 | Area | State |
 |---|---|
 | `afon inspect` (cluster profiling engine) | **Implemented** |
-| `flow.yaml` parser, validation layer & DAG engine | Designed, not built |
+| `flow.yaml` parser, validation layer & DAG engine | **Implemented** (no cluster: `validate`, `plan`, `apply` on a fake driver) |
 | Plan / apply framework via Server-Side Dry-Runs | Designed, not built |
 | Resilient health-gates, release records & rollbacks | Designed, not built |
 | Language-agnostic plugin & extension runtime | Planned |
@@ -45,6 +45,24 @@ afon inspect -n my-app       # target a specific namespace
 afon inspect -o json         # output full profile as JSON
 afon inspect --full          # include raw /readyz endpoints and full API lists
 afon inspect --redact        # scrub server URLs, UIDs, node names, and IPs
+```
+
+## What works today: flow engine (no cluster)
+
+Phase 2 runs the flow pipeline end to end against a **fake driver** — no Docker, no cluster. State (action cache + fake objects) lives in `.afon/` next to the flow file, so reruns across processes are real no-ops.
+
+```bash
+afon validate -f flow.yaml   # parse + compile: types, references, cycles
+afon plan -f flow.yaml       # read-only preview: cached/will-run, create/update/none
+afon apply -f flow.yaml      # re-plan, then execute; banner confirms no cluster is touched
+```
+
+Plan statuses: actions report `cached` or `will-run`; resources report `create`, `update`, `none`, or `known-after-apply` when an upstream action's outputs don't exist yet. A plan's `will-run` is an upper bound — apply reports what actually happened (`succeeded (cached)`).
+
+```bash
+afon plan -f flow.yaml --parallelism 8   # cap concurrent nodes (default 4)
+afon apply -f flow.yaml --state-dir /s   # override state location (default: flow file's dir)
+afon plan -f flow.yaml -o json           # machine-readable plan
 ```
 
 ### What the profile contains
