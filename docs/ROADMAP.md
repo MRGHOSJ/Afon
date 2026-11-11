@@ -32,6 +32,7 @@ Part-time pacing, about 12 weeks to a demoable project. Each phase ends with som
 - ✅ Action cache: canonical hashing and invalidation (disk-backed, atomic writes)
 - ✅ Plan model and renderer (`will-run`/`cached`, `create`/`update`/`none`/`known-after-apply`)
 - ✅ In-memory fake driver (`.afon/fake-state.json` for the CLI) so the whole loop runs without Docker or a cluster
+- ✅ Apply detail output (`created|updated Kind/Name`, `no changes`), aligned status columns, and coverage-gap tests: cancellation, `-o json`, update journeys, reset
 
 **Done when:** `validate`, `plan`, and `apply` work end to end against the fake driver, a failed node leaves consistent state, and the graph, executor, and cache logic have strong tests. **Met** — all green under `go test -race ./...`, including the cross-process apply-twice-then-plan e2e.
 

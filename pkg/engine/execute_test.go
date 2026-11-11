@@ -383,6 +383,55 @@ spec:
 
 // helpers ----------------------------------------------------------------
 
+// TestFormatChanges covers the Detail summary rules: empty → "no changes",
+// ≤3 → past-tensed "created|updated Kind/Name" joined by ", ", >3 → first
+// three plus "+N more".
+func TestFormatChanges(t *testing.T) {
+	diff := func(op driver.Op, kind, name string) driver.Diff {
+		return driver.Diff{Op: op, Object: driver.Object{Kind: kind, Name: name}}
+	}
+	cases := []struct {
+		name    string
+		changed []driver.Diff
+		want    string
+	}{
+		{"empty", nil, "no changes"},
+		{"one create", []driver.Diff{diff(driver.OpCreate, "ConfigMap", "hello")},
+			"created ConfigMap/hello"},
+		{"one update", []driver.Diff{diff(driver.OpUpdate, "Deployment", "web")},
+			"updated Deployment/web"},
+		{"two mixed", []driver.Diff{
+			diff(driver.OpCreate, "ConfigMap", "a"),
+			diff(driver.OpUpdate, "Service", "b"),
+		}, "created ConfigMap/a, updated Service/b"},
+		{"three exact", []driver.Diff{
+			diff(driver.OpCreate, "ConfigMap", "a"),
+			diff(driver.OpCreate, "ConfigMap", "b"),
+			diff(driver.OpCreate, "ConfigMap", "c"),
+		}, "created ConfigMap/a, created ConfigMap/b, created ConfigMap/c"},
+		{"four truncates", []driver.Diff{
+			diff(driver.OpCreate, "ConfigMap", "a"),
+			diff(driver.OpUpdate, "ConfigMap", "b"),
+			diff(driver.OpCreate, "ConfigMap", "c"),
+			diff(driver.OpCreate, "ConfigMap", "d"),
+		}, "created ConfigMap/a, updated ConfigMap/b, created ConfigMap/c, +1 more"},
+		{"five truncates", []driver.Diff{
+			diff(driver.OpCreate, "ConfigMap", "a"),
+			diff(driver.OpCreate, "ConfigMap", "b"),
+			diff(driver.OpCreate, "ConfigMap", "c"),
+			diff(driver.OpCreate, "ConfigMap", "d"),
+			diff(driver.OpCreate, "ConfigMap", "e"),
+		}, "created ConfigMap/a, created ConfigMap/b, created ConfigMap/c, +2 more"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatChanges(tc.changed); got != tc.want {
+				t.Errorf("formatChanges() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // nilDriver returns a driver that fails on use; action-only tests pass it
 // and never touch it.
 func nilDriver() *panicDriver { return &panicDriver{} }

@@ -5,6 +5,7 @@
 package tests
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -118,13 +119,17 @@ func TestFlow_ApplyTwiceThenPlan(t *testing.T) {
 		t.Errorf("plan must not create state in cwd; .afon err = %v", err)
 	}
 
-	// Apply 1: everything runs.
-	r = run("apply", "-f", path)
+	// Apply 1: everything runs. Parallelism 1 keeps node output order
+	// deterministic for the detail assertions below.
+	r = run("apply", "-f", path, "--parallelism", "1")
 	if r.code != 0 {
 		t.Fatalf("apply 1 exit = %d\nstderr: %s", r.code, r.stderr)
 	}
 	if !strings.Contains(r.stdout, "succeeded") {
 		t.Errorf("apply 1 should succeed:\n%s", r.stdout)
+	}
+	if !strings.Contains(r.stdout, "(created ConfigMap/hello)") {
+		t.Errorf("apply 1 must report the created object detail:\n%s", r.stdout)
 	}
 	if strings.Contains(r.stdout, "(cached)") {
 		t.Errorf("apply 1 must not report cached:\n%s", r.stdout)
@@ -138,12 +143,15 @@ func TestFlow_ApplyTwiceThenPlan(t *testing.T) {
 	}
 
 	// Apply 2 (fresh process): action cached, resource no diffs.
-	r = run("apply", "-f", path)
+	r = run("apply", "-f", path, "--parallelism", "1")
 	if r.code != 0 {
 		t.Fatalf("apply 2 exit = %d\nstderr: %s", r.code, r.stderr)
 	}
 	if !strings.Contains(r.stdout, "image") || !strings.Contains(r.stdout, "(cached)") {
 		t.Errorf("apply 2 must cache the action:\n%s", r.stdout)
+	}
+	if !strings.Contains(r.stdout, "(no changes)") {
+		t.Errorf("apply 2 must report the resource's no-changes detail:\n%s", r.stdout)
 	}
 	// The resource node reports succeeded with no applied diffs; the plan
 	// section above it must say none.
@@ -196,4 +204,114 @@ func TestFlow_UnknownDriver(t *testing.T) {
 		t.Fatalf("exit = %d, want 1", r.code)
 	}
 	wantStderrContains(t, r, `unknown driver "k8s"`, "fake")
+}
+
+// TestFlow_JSONOutput pins both directions of the -o json contract: stdout
+// must parse as JSON (banner and errors never leak into it) and the
+// fake-driver banner must appear on stderr. A regression in either
+// direction fails here.
+func TestFlow_JSONOutput(t *testing.T) {
+	path := writeFlow(t)
+	const banner = "fake driver: no cluster is touched"
+
+	// plan -o json: a Plan object with entries.
+	r := runAf(t, nil, "plan", "-f", path, "-o", "json")
+	if r.code != 0 {
+		t.Fatalf("plan exit = %d\nstderr: %s", r.code, r.stderr)
+	}
+	var plan struct {
+		Flow    string `json:"flow"`
+		Entries []struct {
+			NodeID string `json:"nodeId"`
+			Status string `json:"status"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal([]byte(r.stdout), &plan); err != nil {
+		t.Fatalf("plan stdout is not JSON: %v\n%s", err, r.stdout)
+	}
+	if plan.Flow != "e2e" || len(plan.Entries) != 2 {
+		t.Errorf("plan JSON = %+v, want flow e2e with 2 entries", plan)
+	}
+	if !strings.Contains(r.stderr, banner) {
+		t.Errorf("plan stderr missing banner:\n%s", r.stderr)
+	}
+	if strings.Contains(r.stdout, banner) {
+		t.Errorf("banner leaked into plan stdout:\n%s", r.stdout)
+	}
+
+	// apply -o json: a snapshot keyed by node id.
+	r = runAf(t, nil, "apply", "-f", path, "-o", "json")
+	if r.code != 0 {
+		t.Fatalf("apply exit = %d\nstderr: %s", r.code, r.stderr)
+	}
+	var snap map[string]struct {
+		NodeID string `json:"nodeId"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(r.stdout), &snap); err != nil {
+		t.Fatalf("apply stdout is not JSON: %v\n%s", err, r.stdout)
+	}
+	if _, ok := snap["image"]; !ok {
+		t.Errorf("apply JSON missing image node: %s", r.stdout)
+	}
+	if _, ok := snap["obj"]; !ok {
+		t.Errorf("apply JSON missing obj node: %s", r.stdout)
+	}
+	if !strings.Contains(r.stderr, banner) {
+		t.Errorf("apply stderr missing banner:\n%s", r.stderr)
+	}
+	if strings.Contains(r.stdout, banner) {
+		t.Errorf("banner leaked into apply stdout:\n%s", r.stdout)
+	}
+}
+
+// TestFlow_ResetState: deleting .afon/ is the reset — the next plan must
+// predict everything from scratch (will-run + known-after-apply) and the
+// next apply must recreate the objects, not report cached/none.
+func TestFlow_ResetState(t *testing.T) {
+	path := writeFlow(t)
+	stateDir := filepath.Dir(path)
+
+	// Warm state: apply, then confirm the plan is settled.
+	if r := runAf(t, nil, "apply", "-f", path); r.code != 0 {
+		t.Fatalf("apply exit = %d\nstderr: %s", r.code, r.stderr)
+	}
+	r := runAf(t, nil, "plan", "-f", path)
+	if r.code != 0 {
+		t.Fatalf("warm plan exit = %d\nstderr: %s", r.code, r.stderr)
+	}
+	for _, bad := range []string{"will-run", "known-after-apply"} {
+		if strings.Contains(r.stdout, bad) {
+			t.Errorf("warm plan still says %q:\n%s", bad, r.stdout)
+		}
+	}
+
+	// Reset: wipe the state directory contents.
+	if err := os.RemoveAll(filepath.Join(stateDir, ".afon")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cold plan: everything predicted again.
+	r = runAf(t, nil, "plan", "-f", path)
+	if r.code != 0 {
+		t.Fatalf("cold plan exit = %d\nstderr: %s", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "will-run") {
+		t.Errorf("plan after reset should predict will-run:\n%s", r.stdout)
+	}
+	if !strings.Contains(r.stdout, "known-after-apply") {
+		t.Errorf("plan after reset should predict known-after-apply:\n%s", r.stdout)
+	}
+
+	// Cold apply: the object is created again, not reported as unchanged.
+	r = runAf(t, nil, "apply", "-f", path)
+	if r.code != 0 {
+		t.Fatalf("cold apply exit = %d\nstderr: %s", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "(created ConfigMap/hello)") {
+		t.Errorf("apply after reset must recreate the object:\n%s", r.stdout)
+	}
+	if strings.Contains(r.stdout, "(no changes)") {
+		t.Errorf("apply after reset must not report no changes:\n%s", r.stdout)
+	}
 }

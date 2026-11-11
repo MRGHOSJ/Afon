@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 
 	"github.com/MRGHOSJ/afon/pkg/driver"
@@ -21,6 +22,12 @@ var (
 	flagParallelism int
 )
 
+// notifyContext wraps context cancellation in a signal handler (SIGINT /
+// SIGTERM → cancel). It is a variable so tests can inject a context they
+// cancel themselves, exercising the same cancellation path as Ctrl-C
+// without sending a real signal to the process.
+var notifyContext = signal.NotifyContext
+
 func init() {
 	rootCmd.AddCommand(newPlanCmd(), newApplyCmd())
 }
@@ -31,7 +38,7 @@ func newPlanCmd() *cobra.Command {
 		Use:   "plan",
 		Short: "Show what an apply would do, without executing anything",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			ctx, stop := notifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			return runPlan(ctx)
 		},
@@ -46,7 +53,7 @@ func newApplyCmd() *cobra.Command {
 		Use:   "apply",
 		Short: "Execute a flow: re-plan, then run against the driver",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			ctx, stop := notifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			return runApply(ctx)
 		},
@@ -142,34 +149,52 @@ func runApply(ctx context.Context) error {
 	res, err := engine.Apply(ctx, cf, store, d, engine.ExecutorOptions{
 		Parallelism: flagParallelism,
 	})
-	if res != nil && flagOutput == "json" {
-		out, mErr := json.MarshalIndent(res.Snapshot(), "", "  ")
-		if mErr == nil {
-			fmt.Println(string(out))
+	// Results print even when Apply returns an error (e.g. a cancelled
+	// run): the per-node statuses are the point of the output.
+	if flagOutput == "json" {
+		if res != nil {
+			out, mErr := json.MarshalIndent(res.Snapshot(), "", "  ")
+			if mErr == nil {
+				fmt.Println(string(out))
+			}
 		}
-	}
-	if err != nil {
-		return err
-	}
-	if flagOutput != "json" {
+	} else if res != nil {
 		fmt.Print(renderRunResult(res))
 	}
-	return nil
+	return err
 }
 
+// renderRunResult formats per-node apply outcomes. The status column is
+// padded to the longest status so every suffix starts at the same column:
+// find the status, skip the spaces, and you land on the suffix. Suffix
+// priority: error, then cached, then detail — a single space separates
+// the status field from a non-space-leading suffix.
 func renderRunResult(res *engine.RunResult) string {
 	snap := res.Snapshot()
+	ids := sortedKeys(snap)
+	maxW := 0
+	for _, id := range ids {
+		if w := len(string(snap[id].Status)); w > maxW {
+			maxW = w
+		}
+	}
 	out := "apply result:\n"
-	for _, id := range sortedKeys(snap) {
+	for _, id := range ids {
 		r := snap[id]
-		line := fmt.Sprintf("  %-16s %s", id, r.Status)
-		if r.Cached {
-			line += " (cached)"
+		line := fmt.Sprintf("  %-16s %-*s", id, maxW, r.Status)
+		var suffix string
+		switch {
+		case r.ErrText != "":
+			suffix = ": " + r.ErrText
+		case r.Cached:
+			suffix = "(cached)"
+		case r.Detail != "":
+			suffix = "(" + r.Detail + ")"
 		}
-		if r.ErrText != "" {
-			line += ": " + r.ErrText
+		if suffix != "" {
+			line += " " + suffix
 		}
-		out += line + "\n"
+		out += strings.TrimRight(line, " ") + "\n"
 	}
 	return out
 }

@@ -193,12 +193,20 @@ func outputsLookup(upstream map[string]Outputs) func(node, output string) (Value
 	}
 }
 
-// RenderText formats a plan as the CLI's text output.
+// RenderText formats a plan as the CLI's text output. The status column
+// is padded to the longest status so every suffix starts at the same
+// column: find the status, skip the spaces, and you land on the suffix.
 func (p *Plan) RenderText() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "plan for %q (%s)\n", p.Flow, orNone2(p.File))
+	maxW := 0
 	for _, e := range p.Entries {
-		line := fmt.Sprintf("  %-16s %-8s %s", e.NodeID, e.Kind, e.Status)
+		if w := len(e.Status); w > maxW {
+			maxW = w
+		}
+	}
+	for _, e := range p.Entries {
+		line := fmt.Sprintf("  %-16s %-8s %-*s", e.NodeID, e.Kind, maxW, e.Status)
 		switch e.Status {
 		case PlanCached:
 			line += fmt.Sprintf("  key=%.12s", e.Key)
@@ -216,7 +224,7 @@ func (p *Plan) RenderText() string {
 		if e.Reason != "" {
 			line += fmt.Sprintf("  (%s)", e.Reason)
 		}
-		b.WriteString(line + "\n")
+		b.WriteString(strings.TrimRight(line, " ") + "\n")
 	}
 	// Summary line in a stable status order.
 	order := []string{PlanCached, PlanWillRun, PlanCreate, PlanUpdate, PlanNone, PlanKnownAfterApply}

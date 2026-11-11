@@ -133,6 +133,40 @@ func TestPlan_ReadOnly(t *testing.T) {
 	}
 }
 
+// TestApply_DetailOnResourceResults: a resource node's success carries a
+// human Detail — "created ConfigMap/hello" on first apply, "no changes"
+// when nothing changed.
+func TestApply_DetailOnResourceResults(t *testing.T) {
+	cf, err := compile(t, twoNodeFlow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewMemoryStore()
+	d := fake.New()
+	ctx := context.Background()
+
+	res1, err := Apply(ctx, cf, store, d, ExecutorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := res1.Get("obj"); r.Detail != "created ConfigMap/hello" {
+		t.Errorf("first apply obj.Detail = %q, want %q", r.Detail, "created ConfigMap/hello")
+	}
+	// Action nodes have no diffs; their Detail stays empty (the cached
+	// marker is the renderer's job).
+	if r, _ := res1.Get("image"); r.Detail != "" {
+		t.Errorf("image.Detail = %q, want empty", r.Detail)
+	}
+
+	res2, err := Apply(ctx, cf, store, d, ExecutorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := res2.Get("obj"); r.Detail != "no changes" {
+		t.Errorf("second apply obj.Detail = %q, want %q", r.Detail, "no changes")
+	}
+}
+
 // TestApplyTwiceThenPlan is the cross-run contract: apply, apply, plan →
 // everything cached or none (the no-op rerun demo). Uses the disk-backed
 // store and persistent fake driver, as the CLI does.

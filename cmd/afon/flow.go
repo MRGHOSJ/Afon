@@ -26,14 +26,20 @@ func stateDirFor(flowPath, flagDir string) (string, error) {
 	return filepath.Dir(abs), nil
 }
 
+// extraNodeTypes lets tests register ad-hoc node types (e.g. a fake sleep
+// node for cancellation tests) without shipping them in the CLI's real
+// registry. Production never sets it.
+var extraNodeTypes []engine.NodeType
+
 // newRegistry builds the node-type registry explicitly (engine rule 5):
-// no init() magic, so tests can construct their own.
-func newRegistry() (*engine.Registry, error) {
+// no init() magic, so tests can construct their own. Callers may append
+// extra types (tests inject their own; production passes none).
+func newRegistry(extra ...engine.NodeType) (*engine.Registry, error) {
 	reg := engine.NewRegistry()
-	for _, nt := range []engine.NodeType{
+	for _, nt := range append([]engine.NodeType{
 		engine.ImageRef{},
 		engine.FakeObject{},
-	} {
+	}, extra...) {
 		if err := reg.Register(nt); err != nil {
 			return nil, err
 		}
@@ -48,7 +54,7 @@ func parseFlow(path string) (*engine.CompiledFlow, error) {
 	if err != nil {
 		return nil, err
 	}
-	reg, err := newRegistry()
+	reg, err := newRegistry(extraNodeTypes...)
 	if err != nil {
 		return nil, err
 	}

@@ -57,7 +57,7 @@ afon plan -f flow.yaml       # read-only preview: cached/will-run, create/update
 afon apply -f flow.yaml      # re-plan, then execute; banner confirms no cluster is touched
 ```
 
-Plan statuses: actions report `cached` or `will-run`; resources report `create`, `update`, `none`, or `known-after-apply` when an upstream action's outputs don't exist yet. A plan's `will-run` is an upper bound — apply reports what actually happened (`succeeded (cached)`).
+Plan statuses: actions report `cached` or `will-run`; resources report `create`, `update`, `none`, or `known-after-apply` when an upstream action's outputs don't exist yet. A plan's `will-run` is an upper bound — apply reports what actually happened, with a per-node detail after the status: `succeeded (cached)`, `succeeded (created ConfigMap/hello)`, or `succeeded (no changes)`.
 
 ```bash
 afon plan -f flow.yaml --parallelism 8   # cap concurrent nodes (default 4)

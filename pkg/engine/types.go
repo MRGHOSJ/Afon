@@ -88,6 +88,10 @@ type NodeResult struct {
 	Err       error   `json:"-"`
 	ErrText   string  `json:"error,omitempty"`
 	DiffCount int     `json:"diffCount,omitempty"`
+	// Detail is a short human summary of what the node did, e.g.
+	// "created ConfigMap/hello" or "no changes". Rendered by the CLI
+	// after the status column.
+	Detail string `json:"detail,omitempty"`
 }
 
 // RunResult is the outcome of one apply. All writes go through Record so

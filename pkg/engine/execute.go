@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/MRGHOSJ/afon/pkg/driver"
@@ -276,7 +277,8 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 				return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: err}
 			}
 		}
-		return NodeResult{NodeID: cn.ID, Status: StatusSucceeded, DiffCount: len(changed)}
+		return NodeResult{NodeID: cn.ID, Status: StatusSucceeded,
+			DiffCount: len(changed), Detail: formatChanges(changed)}
 
 	default:
 		return NodeResult{
@@ -285,4 +287,30 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 			Err:    fmt.Errorf("node type %q implements neither ActionType nor ResourceType", cn.Type),
 		}
 	}
+}
+
+// formatChanges summarizes the changed diffs a resource node applied:
+// "no changes", up to three past-tensed "created Kind/Name" entries, or
+// the first three plus "+N more" when there are more than three.
+func formatChanges(changed []driver.Diff) string {
+	if len(changed) == 0 {
+		return "no changes"
+	}
+	const max = 3
+	n := len(changed)
+	if n > max {
+		n = max
+	}
+	parts := make([]string, 0, n+1)
+	for _, df := range changed[:n] {
+		verb := "updated"
+		if df.Op == driver.OpCreate {
+			verb = "created"
+		}
+		parts = append(parts, fmt.Sprintf("%s %s/%s", verb, df.Object.Kind, df.Object.Name))
+	}
+	if len(changed) > max {
+		parts = append(parts, fmt.Sprintf("+%d more", len(changed)-max))
+	}
+	return strings.Join(parts, ", ")
 }
