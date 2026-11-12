@@ -40,6 +40,7 @@ func newRegistry(extra ...engine.NodeType) (*engine.Registry, error) {
 		engine.ImageRef{},
 		engine.FakeObject{},
 		engine.K8sManifests{},
+		engine.AppManifests{},
 		engine.K8sApply{},
 	}, extra...) {
 		if err := reg.Register(nt); err != nil {

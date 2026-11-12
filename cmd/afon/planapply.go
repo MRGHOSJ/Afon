@@ -24,6 +24,7 @@ var (
 	flagParallelism    int
 	flagForceConflicts bool
 	flagNoPrune        bool
+	flagShowRendered   bool
 )
 
 // notifyContext wraps context cancellation in a signal handler (SIGINT /
@@ -63,6 +64,8 @@ func newApplyCmd() *cobra.Command {
 		},
 	}
 	addFlowFlags(cmd)
+	cmd.Flags().BoolVar(&flagShowRendered, "show-rendered", false,
+		"print each known action output from the plan to stderr before executing")
 	return cmd
 }
 
@@ -131,6 +134,9 @@ func runPlan(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := warnStaleMaterialized(cf); err != nil {
+		return err
+	}
 	d, err := buildDriver(stateDir, cf.Target)
 	if err != nil {
 		return err
@@ -156,6 +162,9 @@ func runApply(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := warnStaleMaterialized(cf); err != nil {
+		return err
+	}
 	d, err := buildDriver(stateDir, cf.Target)
 	if err != nil {
 		return err
@@ -170,6 +179,9 @@ func runApply(ctx context.Context) error {
 	if flagOutput != "json" {
 		fmt.Print(p.RenderText())
 		fmt.Println()
+	}
+	if flagShowRendered {
+		printActionOutputs(p)
 	}
 
 	res, err := engine.Apply(ctx, cf, store, d, engine.ExecutorOptions{
@@ -188,6 +200,51 @@ func runApply(ctx context.Context) error {
 		fmt.Print(renderRunResult(res))
 	}
 	return err
+}
+
+// warnStaleMaterialized prints engine staleness warnings to stderr: a
+// materialized file whose recorded config hash no longer matches the
+// flow means the flow was edited after render. A warning, never an
+// error — the file is still what plan/apply use as-is.
+func warnStaleMaterialized(cf *engine.CompiledFlow) error {
+	warns, err := engine.StaleMaterialized(cf)
+	if err != nil {
+		return err
+	}
+	for _, w := range warns {
+		fmt.Fprintf(os.Stderr,
+			"warning: node %q: materialized file %s is stale (flow config changed since render); run \"afon render -f %s\"\n",
+			w.NodeID, w.Path, flagFlowFile)
+	}
+	return nil
+}
+
+// printActionOutputs dumps the plan's known action outputs to stderr —
+// the exact bytes downstream nodes will see — before apply executes.
+// stderr keeps `apply -o json` stdout parseable.
+func printActionOutputs(p *engine.Plan) {
+	ids := make([]string, 0, len(p.ActionOutputs))
+	for id := range p.ActionOutputs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		outs := p.ActionOutputs[id]
+		keys := make([]string, 0, len(outs))
+		for k := range outs {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			o := outs[k]
+			fmt.Fprintf(os.Stderr, "--- node %s output %s ---\n", id, k)
+			if o.Known {
+				fmt.Fprintln(os.Stderr, o.Data)
+			} else {
+				fmt.Fprintln(os.Stderr, "(unknown)")
+			}
+		}
+	}
 }
 
 // renderRunResult formats per-node apply outcomes. The status column is

@@ -1,6 +1,8 @@
-// Package tests drives the built afon binary end to end. Scope is error
-// paths only: every way the CLI can exit non-zero with an actionable message.
-// Success output is covered by the golden tests in cmd/afon.
+// Package tests drives the built afon binary end to end. Two scopes:
+// error paths (every way the CLI can exit non-zero with an actionable
+// message) and the materialized render → plan → apply lifecycle
+// (render_test.go). Golden success output for other commands lives in
+// cmd/afon.
 package tests
 
 import (

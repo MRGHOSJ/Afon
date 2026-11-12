@@ -218,6 +218,25 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 		return v, ok
 	}
 
+	// Flow-level Inputs shared by both kinds: the flow file location and
+	// target. Plan and apply compute identical InputCacher keys from it.
+	in := Inputs{FlowFile: cf.File, Target: cf.Target}
+	// Owner stamps driver calls so an inventory driver can scope prune
+	// and ownership to this flow + node.
+	owner := driver.Owner{Flow: cf.Name, Node: cn.ID}
+
+	// Materialized action nodes: the file is the output — read it and
+	// return before Resolve or the cache. Skipping Resolve means an
+	// uncached upstream cannot fail a node whose output lives on disk;
+	// skipping the cache means a hand-edit always wins over stale
+	// cached bytes (engine rule about edits: plan/apply honor them).
+	if outs, path, ok, err := materializedOutputs(cn, in); err != nil {
+		return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: err}
+	} else if ok {
+		return NodeResult{NodeID: cn.ID, Status: StatusSucceeded, Outputs: outs,
+			Detail: fmt.Sprintf("from %s", path)}
+	}
+
 	resolved, err := Resolve(cn.Config, lookup)
 	if err != nil {
 		return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: err}
@@ -229,13 +248,6 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 			Err:    fmt.Errorf("upstream %q did not produce required outputs", resolved.UnknownFrom),
 		}
 	}
-
-	// Flow-level Inputs shared by both kinds: the flow file location and
-	// target. Plan and apply compute identical InputCacher keys from it.
-	in := Inputs{FlowFile: cf.File, Target: cf.Target}
-	// Owner stamps driver calls so an inventory driver can scope prune
-	// and ownership to this flow + node.
-	owner := driver.Owner{Flow: cf.Name, Node: cn.ID}
 
 	switch nt := cn.NT.(type) {
 	case ActionType:

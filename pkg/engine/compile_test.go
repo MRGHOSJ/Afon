@@ -11,7 +11,7 @@ import (
 func testRegistry(t *testing.T) *Registry {
 	t.Helper()
 	reg := NewRegistry()
-	for _, nt := range []NodeType{ImageRef{}, FakeObject{}, K8sManifests{}, K8sApply{}} {
+	for _, nt := range []NodeType{ImageRef{}, FakeObject{}, K8sManifests{}, AppManifests{}, K8sApply{}} {
 		if err := reg.Register(nt); err != nil {
 			t.Fatal(err)
 		}

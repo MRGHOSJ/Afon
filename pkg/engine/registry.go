@@ -51,6 +51,21 @@ type InputCacher interface {
 	CacheInputs(cfg any, in Inputs) (extra string, err error)
 }
 
+// MaterializedNode is an action node whose output can live in a file
+// that plan and apply read instead of re-running the node. The engine
+// passes the node's marked config (out is required to be a literal, so
+// resolution state never matters for the path) plus the flow Inputs.
+// A non-empty path opts into the materialized workflow: RenderActions
+// writes the Run output there with a provenance header, and plan/apply
+// read the file back as the node's outputs — a hand-edit wins over any
+// cache. Returning an empty path keeps today's ephemeral behavior.
+// Implementations should declare exactly one output; the engine sets
+// every declared output to the file's contents.
+type MaterializedNode interface {
+	NodeType
+	MaterializedPath(cfg any, in Inputs) (string, error)
+}
+
 // ResourceType declares what should exist in the cluster. It never talks
 // to a driver: the engine diffs Desired's objects itself.
 type ResourceType interface {

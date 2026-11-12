@@ -13,6 +13,9 @@ import (
 const (
 	// PlanCached: action key hit the store; outputs are known.
 	PlanCached = "cached"
+	// PlanFile: materialized action whose output was read from its
+	// rendered file — no cache consulted, the file is the truth.
+	PlanFile = "file"
 	// PlanWillRun: action will execute (or its key could not be computed
 	// because upstream outputs are unknown — an upper bound, engine rule 1).
 	PlanWillRun = "will-run"
@@ -48,6 +51,11 @@ type Plan struct {
 	Entries []PlanEntry `json:"entries"`
 	// Summary counts by status, for a one-line footer.
 	Summary map[string]int `json:"summary"`
+	// ActionOutputs carries the known action outputs plan already
+	// resolved — materialized file contents and cache hits — for CLI
+	// transparency (--show-rendered). Not serialized: plan JSON stays
+	// exactly what it was before materialized nodes existed.
+	ActionOutputs map[string]Outputs `json:"-"`
 }
 
 // BuildPlan walks the compiled flow in topological order and decides each
@@ -57,9 +65,10 @@ type Plan struct {
 // (design Unknown rules).
 func BuildPlan(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driver) (*Plan, error) {
 	p := &Plan{
-		Flow:    cf.Name,
-		File:    cf.File,
-		Summary: map[string]int{},
+		Flow:          cf.Name,
+		File:          cf.File,
+		Summary:       map[string]int{},
+		ActionOutputs: map[string]Outputs{},
 	}
 	// upstream maps node ID → outputs known at plan time.
 	upstream := map[string]Outputs{}
@@ -82,8 +91,17 @@ func BuildPlan(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driv
 		switch cn.NT.Kind() {
 		case KindAction:
 			var outs Outputs
-			entry, outs = planAction(cn, resolved, store, in)
+			entry, outs, err = planAction(cn, resolved, store, in)
+			if err != nil {
+				// Materialized file missing (or unreadable): plan fails
+				// loudly, naming the node and the fix.
+				return nil, &ConfigError{Pos: cn.IDPos, Message: err.Error()}
+			}
 			upstream[cn.ID] = outs
+			switch entry.Status {
+			case PlanCached, PlanFile:
+				p.ActionOutputs[cn.ID] = outs
+			}
 
 		case KindResource:
 			entry = planResource(ctx, cf, cn, resolved, d, upstream)
@@ -97,10 +115,13 @@ func BuildPlan(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driv
 }
 
 // planAction decides an action's treatment and returns the outputs known to
-// downstream nodes at plan time: real ones on a cache hit, Unknown on a
-// miss. A key error (including a failing InputCacher) degrades to
-// will-run with the reason — plan never executes.
-func planAction(cn *CompiledNode, resolved ResolveOutcome, store Store, in Inputs) (PlanEntry, Outputs) {
+// downstream nodes at plan time: real ones on a cache hit, the file's
+// contents for a materialized node, Unknown on a miss. A key error
+// (including a failing InputCacher) degrades to will-run with the reason —
+// plan never executes. A materialized node with a missing file is an
+// error: the file is the artifact, and falling back to cache or
+// will-run would hide that it is gone.
+func planAction(cn *CompiledNode, resolved ResolveOutcome, store Store, in Inputs) (PlanEntry, Outputs, error) {
 	entry := PlanEntry{NodeID: cn.ID, Kind: KindAction}
 	declared := func() Outputs {
 		outs := Outputs{}
@@ -109,28 +130,39 @@ func planAction(cn *CompiledNode, resolved ResolveOutcome, store Store, in Input
 		}
 		return outs
 	}
+	// Materialized nodes read their output from the file — checked
+	// before the resolved-unknown and cache paths: the file is the
+	// truth even when the node's own config refs an uncached upstream
+	// (out: is literal, so the path never depends on resolution).
+	if outs, path, ok, err := materializedOutputs(cn, in); err != nil {
+		return PlanEntry{}, nil, err
+	} else if ok {
+		entry.Status = PlanFile
+		entry.Reason = path
+		return entry, outs, nil
+	}
 	if !resolved.Known {
 		// Inputs unknown → key cannot be computed → will run. This is an
 		// upper bound: apply may still hit the cache (engine rule 1).
 		entry.Status = PlanWillRun
 		entry.Reason = fmt.Sprintf("inputs unknown until %q runs", resolved.UnknownFrom)
-		return entry, declared()
+		return entry, declared(), nil
 	}
 	key, err := actionCacheKey(cn, resolved, in)
 	if err != nil {
 		entry.Status = PlanWillRun
 		entry.Reason = err.Error()
-		return entry, declared()
+		return entry, declared(), nil
 	}
 	entry.Key = key
 	outs, ok, err := store.Get(key)
 	if err == nil && ok && store.Verify(key, outs) {
 		entry.Status = PlanCached
 		// A cache hit supplies real outputs, so downstream plans normally.
-		return entry, outs
+		return entry, outs, nil
 	}
 	entry.Status = PlanWillRun
-	return entry, declared()
+	return entry, declared(), nil
 }
 
 func planResource(ctx context.Context, cf *CompiledFlow, cn *CompiledNode, resolved ResolveOutcome, d driver.Driver, upstream map[string]Outputs) PlanEntry {
@@ -247,7 +279,7 @@ func (p *Plan) RenderText() string {
 	}
 	// Summary line in a stable order; deletes lead the diff group so a
 	// destructive plan is visible at a glance (risk-first for review).
-	order := []string{PlanCached, PlanWillRun, PlanDelete, PlanCreate, PlanUpdate, PlanNone, PlanKnownAfterApply}
+	order := []string{PlanCached, PlanFile, PlanWillRun, PlanDelete, PlanCreate, PlanUpdate, PlanNone, PlanKnownAfterApply}
 	var parts []string
 	for _, s := range order {
 		if n := p.Summary[s]; n > 0 {
