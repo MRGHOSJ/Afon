@@ -199,11 +199,11 @@ func TestFlow_ValidateRejectsRollback(t *testing.T) {
 // says what exists.
 func TestFlow_UnknownDriver(t *testing.T) {
 	path := writeFlow(t)
-	r := runAf(t, nil, "plan", "-f", path, "--driver", "k8s")
+	r := runAf(t, nil, "plan", "-f", path, "--driver", "terraform")
 	if r.code != 1 {
 		t.Fatalf("exit = %d, want 1", r.code)
 	}
-	wantStderrContains(t, r, `unknown driver "k8s"`, "fake")
+	wantStderrContains(t, r, `unknown driver "terraform"`, "fake", "k8s")
 }
 
 // TestFlow_JSONOutput pins both directions of the -o json contract: stdout

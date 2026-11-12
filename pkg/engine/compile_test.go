@@ -7,11 +7,11 @@ import (
 	"github.com/MRGHOSJ/afon/pkg/schema"
 )
 
-// testRegistry returns the Phase 2 node types, same set the CLI registers.
+// testRegistry returns the Phase 3 node types, same set the CLI registers.
 func testRegistry(t *testing.T) *Registry {
 	t.Helper()
 	reg := NewRegistry()
-	for _, nt := range []NodeType{ImageRef{}, FakeObject{}} {
+	for _, nt := range []NodeType{ImageRef{}, FakeObject{}, K8sManifests{}, K8sApply{}} {
 		if err := reg.Register(nt); err != nil {
 			t.Fatal(err)
 		}

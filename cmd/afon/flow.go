@@ -39,6 +39,8 @@ func newRegistry(extra ...engine.NodeType) (*engine.Registry, error) {
 	for _, nt := range append([]engine.NodeType{
 		engine.ImageRef{},
 		engine.FakeObject{},
+		engine.K8sManifests{},
+		engine.K8sApply{},
 	}, extra...) {
 		if err := reg.Register(nt); err != nil {
 			return nil, err

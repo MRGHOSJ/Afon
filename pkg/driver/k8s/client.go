@@ -51,28 +51,31 @@ type Driver struct {
 	mapper    RESTMapper
 	namespace string
 	force     bool
+	prune     bool
 }
 
 // New binds a driver to a namespace. force mirrors --force-conflicts:
-// when true, applies take field ownership instead of failing with
-// driver.ErrConflict; it never overrides ownership refusal, which is
-// Plan's job. namespace must be non-empty — the driver manages exactly
-// one, and cluster-scoped objects are refused with
-// driver.ErrClusterScoped.
-func New(dyn dynamic.Interface, mapper RESTMapper, namespace string, force bool) (*Driver, error) {
+// when true, applies (and plan's dry-run classification) take field
+// ownership instead of failing with driver.ErrConflict; it never
+// overrides ownership refusal, which is Plan's job. prune mirrors
+// --no-prune: when false, Plan skips the owner-scoped prune LIST, so
+// plan and apply agree that nothing will be deleted. namespace must
+// be non-empty — the driver manages exactly one, and cluster-scoped
+// objects are refused with driver.ErrClusterScoped.
+func New(dyn dynamic.Interface, mapper RESTMapper, namespace string, force, prune bool) (*Driver, error) {
 	if dyn == nil || mapper == nil {
 		return nil, fmt.Errorf("k8s driver: dynamic client and REST mapper are required")
 	}
 	if namespace == "" {
 		return nil, fmt.Errorf("k8s driver: namespace is required")
 	}
-	return &Driver{dyn: dyn, mapper: mapper, namespace: namespace, force: force}, nil
+	return &Driver{dyn: dyn, mapper: mapper, namespace: namespace, force: force, prune: prune}, nil
 }
 
 // NewFromConfig builds discovery, a REST mapper, and a dynamic client
 // from a rest config (the CLI wires this to its --context handling).
 // The mapper snapshots the server's API groups at this moment.
-func NewFromConfig(cfg *rest.Config, namespace string, force bool) (*Driver, error) {
+func NewFromConfig(cfg *rest.Config, namespace string, force, prune bool) (*Driver, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("k8s driver: rest config is required")
 	}
@@ -88,7 +91,7 @@ func NewFromConfig(cfg *rest.Config, namespace string, force bool) (*Driver, err
 	if err != nil {
 		return nil, fmt.Errorf("k8s driver: dynamic client: %w", err)
 	}
-	return New(dyn, restmapper.NewDiscoveryRESTMapper(groupResources), namespace, force)
+	return New(dyn, restmapper.NewDiscoveryRESTMapper(groupResources), namespace, force, prune)
 }
 
 // mappingFor resolves the object's group/kind (and version, when set;

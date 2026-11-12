@@ -12,7 +12,8 @@ import (
 
 // Plan diffs desired objects against live state, scoped to owner.
 // Read-only by construction: classification rides dry-run applies
-// (which never persist) and prune is a label-scoped LIST. Order is
+// (which never persist) and prune — skipped entirely when the driver
+// runs with prune off (--no-prune) — is a label-scoped LIST. Order is
 // sortDiffs' — dependency order with deletes last — which is also the
 // order Apply will execute.
 func (d *Driver) Plan(ctx context.Context, owner driver.Owner, desired []driver.Object) ([]driver.Diff, error) {
@@ -40,11 +41,13 @@ func (d *Driver) Plan(ctx context.Context, owner driver.Owner, desired []driver.
 		}
 		diffs = append(diffs, df)
 	}
-	pruned, err := d.prune(ctx, owner, items)
-	if err != nil {
-		return nil, err
+	if d.prune {
+		pruned, err := d.pruneDiffs(ctx, owner, items)
+		if err != nil {
+			return nil, err
+		}
+		diffs = append(diffs, pruned...)
 	}
-	diffs = append(diffs, pruned...)
 	sortDiffs(diffs)
 	return diffs, nil
 }
@@ -93,14 +96,15 @@ func (d *Driver) classify(ctx context.Context, owner driver.Owner, p prepared) (
 	return driver.Diff{Object: p.obj, Op: op}, nil
 }
 
-// prune lists every kind the desired set touches — the documented
+// pruneDiffs lists every kind the desired set touches — the documented
 // orphan gap is that kinds absent from desired are never listed
 // (Phase 4 inventory closes it) — scoped by owner labels, and turns
 // owned-but-undesired objects into delete diffs. The selector narrows
 // server-side; ownedBy re-verifies client-side, so an object is never
 // deleted on an unverified claim. A kind the server no longer serves
-// (CRD uninstalled) lists as nothing.
-func (d *Driver) prune(ctx context.Context, owner driver.Owner, items []prepared) ([]driver.Diff, error) {
+// (CRD uninstalled) lists as nothing. Plan skips this entirely when
+// the driver runs with prune off (--no-prune).
+func (d *Driver) pruneDiffs(ctx context.Context, owner driver.Owner, items []prepared) ([]driver.Diff, error) {
 	selector := fmt.Sprintf("%s=%s,%s=%s", flowLabel, owner.Flow, nodeLabel, owner.Node)
 	desired := map[schema.GroupVersionResource]map[string]bool{}
 	for _, p := range items {

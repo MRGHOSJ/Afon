@@ -33,3 +33,5 @@ Thumbs.db
 
 # Afon state dir (cache + fake driver state)
 .afon/
+
+demo

@@ -197,15 +197,22 @@ func mergeMaps(old, patch map[string]any) map[string]any {
 	return out
 }
 
-// newTestDriver wires a Driver over a fake cluster seeded with objects.
+// newTestDriver wires a Driver over a fake cluster seeded with objects,
+// pruning on (the default every existing test expects).
 func newTestDriver(t *testing.T, force bool, conflicts map[string]string, seeds ...runtime.Object) (*Driver, *fake.FakeDynamicClient) {
+	t.Helper()
+	return newTestDriverOpts(t, force, true, conflicts, seeds...)
+}
+
+// newTestDriverOpts is newTestDriver with explicit prune control.
+func newTestDriverOpts(t *testing.T, force, prune bool, conflicts map[string]string, seeds ...runtime.Object) (*Driver, *fake.FakeDynamicClient) {
 	t.Helper()
 	listKinds := map[schema.GroupVersionResource]string{
 		cmGVR: "ConfigMapList", svcGVR: "ServiceList", deployGVR: "DeploymentList",
 	}
 	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds, seeds...)
 	installSSAFake(dyn, conflicts)
-	d, err := New(dyn, testMapper(), testNS, force)
+	d, err := New(dyn, testMapper(), testNS, force, prune)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -436,6 +443,70 @@ func TestPlan_Conflict(t *testing.T) {
 		}
 		if _, err := dyn.Tracker().Get(cmGVR, testNS, "cfg", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 			t.Errorf("failed plan persisted the object: %v", err)
+		}
+	})
+
+	// The force flag changes plan, not just apply: the dry-run
+	// classification rides the same force setting, so with the flag a
+	// conflicting object plans as an update instead of failing.
+	t.Run("force plans through the conflict", func(t *testing.T) {
+		d, _ := newTestDriver(t, true, map[string]string{"cfg": "kubectl"},
+			seedNamespace(), appliedCM("cfg", testOwner, map[string]any{"k": "v"}))
+		diffs, err := d.Plan(ctx, testOwner, []driver.Object{desiredCM("cfg", map[string]any{"k": "changed"})})
+		if err != nil {
+			t.Fatalf("Plan with force: %v", err)
+		}
+		if len(diffs) != 1 || diffs[0].Op != driver.OpUpdate {
+			t.Fatalf("diffs = %+v, want one update", diffs)
+		}
+	})
+}
+
+// TestPlan_NoPrune pins --no-prune in both directions: with prune off
+// the plan has no delete diff and apply leaves the stale object alive;
+// with prune on, TestPlan_Prune above shows deletes still happen.
+func TestPlan_NoPrune(t *testing.T) {
+	ctx := context.Background()
+	seeds := func() []runtime.Object {
+		return []runtime.Object{
+			seedNamespace(),
+			appliedCM("keep", testOwner, map[string]any{"k": "v"}),
+			appliedCM("stale", testOwner, map[string]any{"k": "w"}),
+		}
+	}
+	desired := []driver.Object{desiredCM("keep", map[string]any{"k": "v"})}
+
+	t.Run("plan has no delete diff", func(t *testing.T) {
+		d, _ := newTestDriverOpts(t, false, false, nil, seeds()...)
+		diffs, err := d.Plan(ctx, testOwner, desired)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		keep := false
+		for _, df := range diffs {
+			if df.Op == driver.OpDelete {
+				t.Fatalf("prune-off plan produced a delete diff: %+v", df)
+			}
+			if df.Object.Name == "keep" && df.Op == driver.OpNone {
+				keep = true
+			}
+		}
+		if !keep {
+			t.Errorf("diffs = %+v, want keep as none", diffs)
+		}
+	})
+
+	t.Run("apply leaves the stale object alive", func(t *testing.T) {
+		d, dyn := newTestDriverOpts(t, false, false, nil, seeds()...)
+		diffs, err := d.Plan(ctx, testOwner, desired)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		if err := d.Apply(ctx, testOwner, diffs); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if _, err := dyn.Tracker().Get(cmGVR, testNS, "stale", metav1.GetOptions{}); err != nil {
+			t.Errorf("stale object was touched: %v", err)
 		}
 	})
 }
