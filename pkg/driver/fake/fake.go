@@ -57,8 +57,10 @@ func NewPersistent(path string) (*Driver, error) {
 }
 
 // Plan diffs desired objects against live state. Read-only: takes the lock
-// but never mutates.
-func (d *Driver) Plan(ctx context.Context, desired []driver.Object) ([]driver.Diff, error) {
+// but never mutates. Owner is accepted for interface parity; the fake
+// keeps no ownership inventory (Phase 3's Kubernetes driver does), so it
+// never produces delete diffs and ignores the owner.
+func (d *Driver) Plan(ctx context.Context, owner driver.Owner, desired []driver.Object) ([]driver.Diff, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -82,8 +84,10 @@ func (d *Driver) Plan(ctx context.Context, desired []driver.Object) ([]driver.Di
 	return diffs, nil
 }
 
-// Apply carries diffs into live state, atomically per call.
-func (d *Driver) Apply(ctx context.Context, diffs []driver.Diff) error {
+// Apply carries diffs into live state, atomically per call. Owner is
+// ignored as in Plan. OpDelete removes the object; deleting an absent
+// object is an error, never a silent success.
+func (d *Driver) Apply(ctx context.Context, owner driver.Owner, diffs []driver.Diff) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -101,6 +105,11 @@ func (d *Driver) Apply(ctx context.Context, diffs []driver.Diff) error {
 			continue
 		case driver.OpCreate, driver.OpUpdate:
 			next[df.Object.Key()] = df.Object
+		case driver.OpDelete:
+			if _, ok := next[df.Object.Key()]; !ok {
+				return fmt.Errorf("fake driver: delete of absent object %s", df.Object.Key())
+			}
+			delete(next, df.Object.Key())
 		default:
 			return fmt.Errorf("fake driver: unsupported op %q", df.Op)
 		}

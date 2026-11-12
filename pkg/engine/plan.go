@@ -16,10 +16,11 @@ const (
 	// PlanWillRun: action will execute (or its key could not be computed
 	// because upstream outputs are unknown — an upper bound, engine rule 1).
 	PlanWillRun = "will-run"
-	// PlanCreate/PlanUpdate/PlanNone: resource diff results.
+	// PlanCreate/PlanUpdate/PlanNone/PlanDelete: resource diff results.
 	PlanCreate = "create"
 	PlanUpdate = "update"
 	PlanNone   = "none"
+	PlanDelete = "delete"
 	// PlanKnownAfterApply: resource config contains an Unknown value.
 	PlanKnownAfterApply = "known-after-apply"
 )
@@ -62,6 +63,9 @@ func BuildPlan(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driv
 	}
 	// upstream maps node ID → outputs known at plan time.
 	upstream := map[string]Outputs{}
+	// Flow-level Inputs shared by every node: the flow file location and
+	// target. Upstream is added per resource node.
+	in := Inputs{FlowFile: cf.File, Target: cf.Target}
 
 	for _, id := range cf.Topo {
 		if err := ctx.Err(); err != nil {
@@ -78,11 +82,11 @@ func BuildPlan(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driv
 		switch cn.NT.Kind() {
 		case KindAction:
 			var outs Outputs
-			entry, outs = planAction(cn, resolved, store)
+			entry, outs = planAction(cn, resolved, store, in)
 			upstream[cn.ID] = outs
 
 		case KindResource:
-			entry = planResource(ctx, cn, resolved, d, upstream)
+			entry = planResource(ctx, cf, cn, resolved, d, upstream)
 		default:
 			return nil, &ConfigError{Pos: cn.IDPos, Message: fmt.Sprintf("node %q: unknown kind %q", cn.ID, cn.NT.Kind())}
 		}
@@ -93,8 +97,10 @@ func BuildPlan(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driv
 }
 
 // planAction decides an action's treatment and returns the outputs known to
-// downstream nodes at plan time: real ones on a cache hit, Unknown on a miss.
-func planAction(cn *CompiledNode, resolved ResolveOutcome, store Store) (PlanEntry, Outputs) {
+// downstream nodes at plan time: real ones on a cache hit, Unknown on a
+// miss. A key error (including a failing InputCacher) degrades to
+// will-run with the reason — plan never executes.
+func planAction(cn *CompiledNode, resolved ResolveOutcome, store Store, in Inputs) (PlanEntry, Outputs) {
 	entry := PlanEntry{NodeID: cn.ID, Kind: KindAction}
 	declared := func() Outputs {
 		outs := Outputs{}
@@ -110,7 +116,7 @@ func planAction(cn *CompiledNode, resolved ResolveOutcome, store Store) (PlanEnt
 		entry.Reason = fmt.Sprintf("inputs unknown until %q runs", resolved.UnknownFrom)
 		return entry, declared()
 	}
-	key, err := CacheKey(cn.Type, cn.NT.TypeVersion(), resolved.Value)
+	key, err := actionCacheKey(cn, resolved, in)
 	if err != nil {
 		entry.Status = PlanWillRun
 		entry.Reason = err.Error()
@@ -127,7 +133,7 @@ func planAction(cn *CompiledNode, resolved ResolveOutcome, store Store) (PlanEnt
 	return entry, declared()
 }
 
-func planResource(ctx context.Context, cn *CompiledNode, resolved ResolveOutcome, d driver.Driver, upstream map[string]Outputs) PlanEntry {
+func planResource(ctx context.Context, cf *CompiledFlow, cn *CompiledNode, resolved ResolveOutcome, d driver.Driver, upstream map[string]Outputs) PlanEntry {
 	entry := PlanEntry{NodeID: cn.ID, Kind: KindResource}
 	if !resolved.Known {
 		entry.Status = PlanKnownAfterApply
@@ -140,13 +146,15 @@ func planResource(ctx context.Context, cn *CompiledNode, resolved ResolveOutcome
 		entry.Reason = fmt.Sprintf("type %q is not a resource", cn.Type)
 		return entry
 	}
-	objs, err := rt.Desired(ctx, resolved.Value, Inputs{Upstream: upstream})
+	in := Inputs{Upstream: upstream, FlowFile: cf.File, Target: cf.Target}
+	objs, err := rt.Desired(ctx, resolved.Value, in)
 	if err != nil {
 		entry.Status = PlanKnownAfterApply
 		entry.Reason = fmt.Sprintf("desired failed: %v", err)
 		return entry
 	}
-	diffs, err := d.Plan(ctx, objs)
+	owner := driver.Owner{Flow: cf.Name, Node: cn.ID}
+	diffs, err := d.Plan(ctx, owner, objs)
 	if err != nil {
 		entry.Status = PlanKnownAfterApply
 		entry.Reason = fmt.Sprintf("driver plan failed: %v", err)
@@ -164,19 +172,30 @@ func planResource(ctx context.Context, cn *CompiledNode, resolved ResolveOutcome
 	return entry
 }
 
-// worstOp picks the most significant op for a multi-object node: any create
-// wins over update wins over none.
+// worstOp picks the status shown for a multi-object node, risk-ordered:
+// a delete is the one destructive outcome and must never hide behind a
+// create or update on a plan line (review order: delete > create >
+// update > none). Apply executes the opposite way — deletes last — so
+// dependents outlive their dependencies; the two orderings are
+// deliberate and documented in design.md.
 func worstOp(diffs []driver.Diff) string {
-	hasUpdate := false
+	hasDelete, hasCreate, hasUpdate := false, false, false
 	for _, df := range diffs {
 		switch df.Op {
+		case driver.OpDelete:
+			hasDelete = true
 		case driver.OpCreate:
-			return PlanCreate
+			hasCreate = true
 		case driver.OpUpdate:
 			hasUpdate = true
 		}
 	}
-	if hasUpdate {
+	switch {
+	case hasDelete:
+		return PlanDelete
+	case hasCreate:
+		return PlanCreate
+	case hasUpdate:
 		return PlanUpdate
 	}
 	return PlanNone
@@ -214,7 +233,7 @@ func (p *Plan) RenderText() string {
 			if e.Key != "" {
 				line += fmt.Sprintf("  key=%.12s", e.Key)
 			}
-		case PlanCreate, PlanUpdate:
+		case PlanCreate, PlanUpdate, PlanDelete:
 			if e.Diff != nil {
 				line += fmt.Sprintf("  %s %s", e.Diff.Object.Kind, e.Diff.Object.Name)
 			} else if len(e.Diffs) > 0 {
@@ -226,8 +245,9 @@ func (p *Plan) RenderText() string {
 		}
 		b.WriteString(strings.TrimRight(line, " ") + "\n")
 	}
-	// Summary line in a stable status order.
-	order := []string{PlanCached, PlanWillRun, PlanCreate, PlanUpdate, PlanNone, PlanKnownAfterApply}
+	// Summary line in a stable order; deletes lead the diff group so a
+	// destructive plan is visible at a glance (risk-first for review).
+	order := []string{PlanCached, PlanWillRun, PlanDelete, PlanCreate, PlanUpdate, PlanNone, PlanKnownAfterApply}
 	var parts []string
 	for _, s := range order {
 		if n := p.Summary[s]; n > 0 {

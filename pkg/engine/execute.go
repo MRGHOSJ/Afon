@@ -230,9 +230,16 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 		}
 	}
 
+	// Flow-level Inputs shared by both kinds: the flow file location and
+	// target. Plan and apply compute identical InputCacher keys from it.
+	in := Inputs{FlowFile: cf.File, Target: cf.Target}
+	// Owner stamps driver calls so an inventory driver can scope prune
+	// and ownership to this flow + node.
+	owner := driver.Owner{Flow: cf.Name, Node: cn.ID}
+
 	switch nt := cn.NT.(type) {
 	case ActionType:
-		key, err := CacheKey(cn.Type, cn.NT.TypeVersion(), resolved.Value)
+		key, err := actionCacheKey(cn, resolved, in)
 		if err != nil {
 			return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: err}
 		}
@@ -240,7 +247,7 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 		if outs, ok, err := store.Get(key); err == nil && ok && store.Verify(key, outs) {
 			return NodeResult{NodeID: cn.ID, Status: StatusSucceeded, Cached: true, Outputs: outs}
 		}
-		outs, err := nt.Run(ctx, resolved.Value, Inputs{})
+		outs, err := nt.Run(ctx, resolved.Value, in)
 		if err != nil {
 			if ctx.Err() != nil {
 				return NodeResult{NodeID: cn.ID, Status: StatusCancelled, Err: ctx.Err()}
@@ -255,11 +262,11 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 		return NodeResult{NodeID: cn.ID, Status: StatusSucceeded, Outputs: outs}
 
 	case ResourceType:
-		objs, err := nt.Desired(ctx, resolved.Value, Inputs{})
+		objs, err := nt.Desired(ctx, resolved.Value, in)
 		if err != nil {
 			return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: err}
 		}
-		diffs, err := d.Plan(ctx, objs)
+		diffs, err := d.Plan(ctx, owner, objs)
 		if err != nil {
 			return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: err}
 		}
@@ -270,7 +277,7 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 			}
 		}
 		if len(changed) > 0 {
-			if err := d.Apply(ctx, changed); err != nil {
+			if err := d.Apply(ctx, owner, changed); err != nil {
 				if ctx.Err() != nil {
 					return NodeResult{NodeID: cn.ID, Status: StatusCancelled, Err: ctx.Err()}
 				}
@@ -290,8 +297,9 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 }
 
 // formatChanges summarizes the changed diffs a resource node applied:
-// "no changes", up to three past-tensed "created Kind/Name" entries, or
-// the first three plus "+N more" when there are more than three.
+// "no changes", up to three past-tensed "created|updated|deleted
+// Kind/Name" entries, or the first three plus "+N more" when there are
+// more than three.
 func formatChanges(changed []driver.Diff) string {
 	if len(changed) == 0 {
 		return "no changes"
@@ -304,8 +312,11 @@ func formatChanges(changed []driver.Diff) string {
 	parts := make([]string, 0, n+1)
 	for _, df := range changed[:n] {
 		verb := "updated"
-		if df.Op == driver.OpCreate {
+		switch df.Op {
+		case driver.OpCreate:
 			verb = "created"
+		case driver.OpDelete:
+			verb = "deleted"
 		}
 		parts = append(parts, fmt.Sprintf("%s %s/%s", verb, df.Object.Kind, df.Object.Name))
 	}

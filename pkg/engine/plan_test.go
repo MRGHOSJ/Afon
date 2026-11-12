@@ -233,3 +233,30 @@ func TestApplyTwiceThenPlan(t *testing.T) {
 		}
 	}
 }
+
+// TestApply_ResourceOnlyNeverCaches is the Phase 3 invariant: only
+// ActionType consults the store (structural — the resource branch has no
+// store code), so a resource-only flow leaves the store empty after a
+// successful apply. Cluster facts must never be content-addressed.
+func TestApply_ResourceOnlyNeverCaches(t *testing.T) {
+	cf, err := compile(t, singleObjectFlow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewMemoryStore()
+	d := fake.New()
+	if _, err := Apply(context.Background(), cf, store, d, ExecutorOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(store.entries); n != 0 {
+		t.Errorf("store has %d entries after resource-only apply, want 0: %v",
+			n, SortedKeys(store.entries))
+	}
+	// Plan must not write either.
+	if _, err := BuildPlan(context.Background(), cf, store, d); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(store.entries); n != 0 {
+		t.Errorf("store has %d entries after plan, want 0", n)
+	}
+}

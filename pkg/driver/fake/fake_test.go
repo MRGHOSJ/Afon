@@ -14,12 +14,16 @@ func obj(name string, data map[string]any) driver.Object {
 	return driver.Object{Group: "afon.dev", Version: "v1", Kind: "ConfigMap", Name: name, Data: data}
 }
 
+// own is the owner every fake-driver call in these tests carries; the
+// fake ignores it but the interface requires it.
+func own() driver.Owner { return driver.Owner{Flow: "test", Node: "n"} }
+
 func TestPlan_CreateUpdateNone(t *testing.T) {
 	d := New()
 	ctx := context.Background()
 
 	// Nothing live: everything creates.
-	diffs, err := d.Plan(ctx, []driver.Object{obj("a", map[string]any{"x": 1})})
+	diffs, err := d.Plan(ctx, own(), []driver.Object{obj("a", map[string]any{"x": 1})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,10 +32,10 @@ func TestPlan_CreateUpdateNone(t *testing.T) {
 	}
 
 	// Apply, then identical desired: none.
-	if err := d.Apply(ctx, diffs); err != nil {
+	if err := d.Apply(ctx, own(), diffs); err != nil {
 		t.Fatal(err)
 	}
-	diffs, err = d.Plan(ctx, []driver.Object{obj("a", map[string]any{"x": 1})})
+	diffs, err = d.Plan(ctx, own(), []driver.Object{obj("a", map[string]any{"x": 1})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +44,7 @@ func TestPlan_CreateUpdateNone(t *testing.T) {
 	}
 
 	// Changed data: update.
-	diffs, err = d.Plan(ctx, []driver.Object{obj("a", map[string]any{"x": 2})})
+	diffs, err = d.Plan(ctx, own(), []driver.Object{obj("a", map[string]any{"x": 2})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,11 +59,11 @@ func TestPlan_NoPhantomUpdates(t *testing.T) {
 	d := New()
 	ctx := context.Background()
 	live := obj("a", map[string]any{"n": 1.0, "m": map[string]any{"b": "2", "a": "1"}})
-	if err := d.Apply(ctx, []driver.Diff{{Object: live, Op: driver.OpCreate}}); err != nil {
+	if err := d.Apply(ctx, own(), []driver.Diff{{Object: live, Op: driver.OpCreate}}); err != nil {
 		t.Fatal(err)
 	}
 	want := obj("a", map[string]any{"n": 1, "m": map[string]any{"a": "1", "b": "2"}})
-	diffs, err := d.Plan(ctx, []driver.Object{want})
+	diffs, err := d.Plan(ctx, own(), []driver.Object{want})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +80,7 @@ func TestPersistence_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d1.Apply(ctx, []driver.Diff{{Object: obj("a", map[string]any{"x": 1}), Op: driver.OpCreate}}); err != nil {
+	if err := d1.Apply(ctx, own(), []driver.Diff{{Object: obj("a", map[string]any{"x": 1}), Op: driver.OpCreate}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -85,7 +89,7 @@ func TestPersistence_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	diffs, err := d2.Plan(ctx, []driver.Object{obj("a", map[string]any{"x": 1})})
+	diffs, err := d2.Plan(ctx, own(), []driver.Object{obj("a", map[string]any{"x": 1})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +120,7 @@ func TestApply_AtomicOnWriteFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err := d.Apply(ctx, []driver.Diff{{Object: obj("old", nil), Op: driver.OpCreate}}); err != nil {
+	if err := d.Apply(ctx, own(), []driver.Diff{{Object: obj("old", nil), Op: driver.OpCreate}}); err != nil {
 		t.Fatal(err)
 	}
 	oldBytes, err := os.ReadFile(path)
@@ -133,7 +137,7 @@ func TestApply_AtomicOnWriteFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = d.Apply(ctx, []driver.Diff{{Object: obj("new", nil), Op: driver.OpCreate}})
+	err = d.Apply(ctx, own(), []driver.Diff{{Object: obj("new", nil), Op: driver.OpCreate}})
 	if err == nil {
 		t.Fatal("apply must fail when the state write fails")
 	}
@@ -160,12 +164,12 @@ func TestConcurrentApply_ParallelResourceNodes(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			o := obj("obj-"+string(rune('a'+i)), map[string]any{"i": i})
-			diffs, err := d.Plan(ctx, []driver.Object{o})
+			diffs, err := d.Plan(ctx, own(), []driver.Object{o})
 			if err != nil {
 				t.Error(err)
 				return
 			}
-			if err := d.Apply(ctx, diffs); err != nil {
+			if err := d.Apply(ctx, own(), diffs); err != nil {
 				t.Error(err)
 			}
 		}(i)
@@ -173,5 +177,34 @@ func TestConcurrentApply_ParallelResourceNodes(t *testing.T) {
 	wg.Wait()
 	if len(d.Objects()) != 8 {
 		t.Errorf("objects = %d, want 8", len(d.Objects()))
+	}
+}
+
+// TestApply_Delete: OpDelete removes the object (so the next plan sees a
+// create again); deleting an absent object is an error, never a silent
+// success.
+func TestApply_Delete(t *testing.T) {
+	d := New()
+	ctx := context.Background()
+	o := obj("gone", map[string]any{"x": 1})
+	if err := d.Apply(ctx, own(), []driver.Diff{{Object: o, Op: driver.OpCreate}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Apply(ctx, own(), []driver.Diff{{Object: o, Op: driver.OpDelete}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Objects()) != 0 {
+		t.Fatalf("object survived delete: %+v", d.Objects())
+	}
+	diffs, err := d.Plan(ctx, own(), []driver.Object{o})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diffs[0].Op != driver.OpCreate {
+		t.Errorf("after delete, op = %s, want create", diffs[0].Op)
+	}
+	// Absent delete errors.
+	if err := d.Apply(ctx, own(), []driver.Diff{{Object: o, Op: driver.OpDelete}}); err == nil {
+		t.Error("deleting an absent object must error")
 	}
 }

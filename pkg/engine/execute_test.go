@@ -384,8 +384,8 @@ spec:
 // helpers ----------------------------------------------------------------
 
 // TestFormatChanges covers the Detail summary rules: empty → "no changes",
-// ≤3 → past-tensed "created|updated Kind/Name" joined by ", ", >3 → first
-// three plus "+N more".
+// ≤3 → past-tensed "created|updated|deleted Kind/Name" joined by ", ",
+// >3 → first three plus "+N more".
 func TestFormatChanges(t *testing.T) {
 	diff := func(op driver.Op, kind, name string) driver.Diff {
 		return driver.Diff{Op: op, Object: driver.Object{Kind: kind, Name: name}}
@@ -400,10 +400,12 @@ func TestFormatChanges(t *testing.T) {
 			"created ConfigMap/hello"},
 		{"one update", []driver.Diff{diff(driver.OpUpdate, "Deployment", "web")},
 			"updated Deployment/web"},
+		{"one delete", []driver.Diff{diff(driver.OpDelete, "ConfigMap", "old")},
+			"deleted ConfigMap/old"},
 		{"two mixed", []driver.Diff{
+			diff(driver.OpDelete, "Deployment", "old"),
 			diff(driver.OpCreate, "ConfigMap", "a"),
-			diff(driver.OpUpdate, "Service", "b"),
-		}, "created ConfigMap/a, updated Service/b"},
+		}, "deleted Deployment/old, created ConfigMap/a"},
 		{"three exact", []driver.Diff{
 			diff(driver.OpCreate, "ConfigMap", "a"),
 			diff(driver.OpCreate, "ConfigMap", "b"),
@@ -438,10 +440,10 @@ func nilDriver() *panicDriver { return &panicDriver{} }
 
 type panicDriver struct{}
 
-func (p *panicDriver) Plan(ctx context.Context, desired []driver.Object) ([]driver.Diff, error) {
+func (p *panicDriver) Plan(ctx context.Context, owner driver.Owner, desired []driver.Object) ([]driver.Diff, error) {
 	panic("driver used in an action-only test")
 }
-func (p *panicDriver) Apply(ctx context.Context, diffs []driver.Diff) error {
+func (p *panicDriver) Apply(ctx context.Context, owner driver.Owner, diffs []driver.Diff) error {
 	panic("driver used in an action-only test")
 }
 

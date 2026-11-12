@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/MRGHOSJ/afon/pkg/driver"
+	"github.com/MRGHOSJ/afon/pkg/schema"
 )
 
 // NodeType is the union contract every registered type satisfies: the Base
@@ -35,6 +36,21 @@ type ActionType interface {
 	Run(ctx context.Context, cfg any, in Inputs) (Outputs, error)
 }
 
+// InputCacher is the optional extension ActionType for nodes whose output
+// depends on state outside their own config — external file contents, the
+// flow target — that must invalidate the cache when it changes. cfg is the
+// node's resolved config (its paths, and so on) and in carries what config
+// cannot express (the flow target); together they are enough for the node
+// to hash its external state. The node returns a canonical string; the
+// engine composes it into the key as {config, extra} (rule 3), so the node
+// owns staleness and the engine owns composition. Only action nodes are
+// consulted — resource nodes never cache in Phase 3. Errors are
+// asymmetric by design: plan degrades the entry to will-run with the
+// reason (plan never executes), apply fails the node.
+type InputCacher interface {
+	CacheInputs(cfg any, in Inputs) (extra string, err error)
+}
+
 // ResourceType declares what should exist in the cluster. It never talks
 // to a driver: the engine diffs Desired's objects itself.
 type ResourceType interface {
@@ -42,11 +58,19 @@ type ResourceType interface {
 	Desired(ctx context.Context, cfg any, in Inputs) ([]driver.Object, error)
 }
 
-// Inputs carries resolved upstream outputs for nodes that need more than
-// what their own config already references.
+// Inputs carries what a node's own config cannot express: upstream
+// outputs at plan time, the flow file's location for file-relative
+// paths, and the flow's target for nodes that render cluster objects.
 type Inputs struct {
-	// Upstream maps node ID → that node's outputs from this run.
+	// Upstream maps node ID → that node's outputs from this run. Plan
+	// time only: apply resolves config before Run/Desired, so they see
+	// it empty.
 	Upstream map[string]Outputs
+	// FlowFile is the path the flow was read from. File-relative nodes
+	// resolve paths against its directory — never the process cwd.
+	FlowFile string
+	// Target is the flow's spec.target (context/namespace).
+	Target schema.Target
 }
 
 // Registry maps type names to implementations. It is explicit — no init()

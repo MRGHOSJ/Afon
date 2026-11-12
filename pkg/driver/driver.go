@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // Object is a single desired cluster object in Phase 2 terms: identity plus
@@ -36,7 +37,20 @@ const (
 	OpCreate Op = "create"
 	OpUpdate Op = "update"
 	OpNone   Op = "none"
+	// OpDelete: a live object owned by this Owner exists but is absent
+	// from desired — the driver must prune it (design §4 inventory).
+	OpDelete Op = "delete"
 )
+
+// Owner identifies who a Plan/Apply call belongs to: the flow plus the
+// node within it. Drivers with inventory (the Phase 3 Kubernetes driver)
+// label applied objects with it and prune only what the same owner
+// claims, so two apply nodes in one flow never delete each other's
+// objects. Drivers without inventory (fake) accept and ignore it.
+type Owner struct {
+	Flow string `json:"flow"`
+	Node string `json:"node"`
+}
 
 // Diff is one object's planned change.
 type Diff struct {
@@ -46,12 +60,67 @@ type Diff struct {
 
 // Driver plans and applies resource changes. Plan is strictly read-only.
 type Driver interface {
-	// Plan diffs desired objects against live state. It must not mutate
-	// anything, including the driver's own persisted state.
-	Plan(ctx context.Context, desired []Object) ([]Diff, error)
-	// Apply carries diffs into live state. It must be atomic per call: a
-	// failure midway leaves the previous state untouched.
-	Apply(ctx context.Context, diffs []Diff) error
+	// Plan diffs desired objects against live state, scoped to owner:
+	// objects the owner already owns but no longer desires become delete
+	// diffs, and objects owned by a different flow/node are refused with
+	// ErrForeignOwner rather than adopted. It must not mutate anything,
+	// including the driver's own persisted state.
+	Plan(ctx context.Context, owner Owner, desired []Object) ([]Diff, error)
+	// Apply carries diffs into live state, stamped with owner. It must be
+	// atomic per call: a failure midway leaves the previous state
+	// untouched.
+	Apply(ctx context.Context, owner Owner, diffs []Diff) error
+}
+
+// ErrForeignOwner reports a desired object whose live instance carries
+// ownership for a different flow or node. Plan refuses instead of
+// adopting or clobbering it (design §4). Flow and Node are the owners
+// found on the live object.
+type ErrForeignOwner struct {
+	Flow   string
+	Node   string
+	Object Object
+}
+
+func (e *ErrForeignOwner) Error() string {
+	id := e.Object.Kind + "/" + e.Object.Name
+	if e.Object.Namespace != "" {
+		id = e.Object.Namespace + "/" + id
+	}
+	return fmt.Sprintf("%s is owned by flow %q node %q; refusing to manage it from another owner",
+		id, e.Flow, e.Node)
+}
+
+// ErrConflict reports an SSA field conflict: another field manager owns
+// fields this apply tried to set and force was not enabled. Managers are
+// parsed from the API status. Never returned for optimistic-concurrency
+// (resourceVersion) conflicts — those are not field-manager disputes.
+type ErrConflict struct {
+	Object   Object
+	Managers []string
+}
+
+func (e *ErrConflict) Error() string {
+	return fmt.Sprintf("%s/%s: fields owned by %s; re-run with --force-conflicts to take ownership",
+		e.Object.Kind, e.Object.Name, strings.Join(e.Managers, ", "))
+}
+
+// ErrClusterScoped reports a cluster-scoped object passed to a driver
+// managing one namespace. Phase 3 rejects them explicitly; handling them
+// needs flow-level inventory (Phase 4). G/V/K are driver-local strings —
+// this leaf package never imports discovery or schema types.
+type ErrClusterScoped struct {
+	Group   string
+	Version string
+	Kind    string
+}
+
+func (e *ErrClusterScoped) Error() string {
+	gv := e.Version
+	if e.Group != "" {
+		gv = e.Group + "/" + e.Version
+	}
+	return fmt.Sprintf("%s %s is cluster-scoped; only namespace-scoped objects can be managed", gv, e.Kind)
 }
 
 // Canonical returns the deterministic JSON form of an object's Data.

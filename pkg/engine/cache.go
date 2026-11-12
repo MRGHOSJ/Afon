@@ -20,11 +20,41 @@ import (
 // edge or an unrelated output invalidate the cache for no reason
 // (engine rule 3).
 func CacheKey(nodeType, typeVersion string, resolvedConfig any) (string, error) {
-	payload := map[string]any{
+	return hashPayload(map[string]any{
 		"type":        nodeType,
 		"typeVersion": typeVersion,
 		"config":      resolvedConfig,
+	})
+}
+
+// actionCacheKey computes an action's cache key. For node types that
+// implement InputCacher the payload gains the node's own contribution of
+// external state; the wrapped {config, extra} form is normalized and
+// marshaled with sorted keys (no map iteration), so plan and apply
+// always agree. Types that don't implement it keep the exact
+// {type, typeVersion, config} payload CacheKey has always hashed —
+// no existing keys churn.
+func actionCacheKey(cn *CompiledNode, resolved ResolveOutcome, in Inputs) (string, error) {
+	ic, ok := cn.NT.(InputCacher)
+	if !ok {
+		return CacheKey(cn.Type, cn.NT.TypeVersion(), resolved.Value)
 	}
+	extra, err := ic.CacheInputs(resolved.Value, in)
+	if err != nil {
+		return "", fmt.Errorf("cache inputs for %q: %w", cn.Type, err)
+	}
+	return hashPayload(map[string]any{
+		"type":        cn.Type,
+		"typeVersion": cn.NT.TypeVersion(),
+		"config":      resolved.Value,
+		"extra":       extra,
+	})
+}
+
+// hashPayload canonicalizes payload (Normalize: sorted keys, canonical
+// numbers; encoding/json: sorted map keys) and returns its sha256 hex —
+// one serialization path for every cache key.
+func hashPayload(payload any) (string, error) {
 	norm, err := driver.Normalize(payload)
 	if err != nil {
 		return "", fmt.Errorf("normalizing cache input: %w", err)
