@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Object is a single desired cluster object in Phase 2 terms: identity plus
@@ -70,6 +71,19 @@ type Driver interface {
 	// atomic per call: a failure midway leaves the previous state
 	// untouched.
 	Apply(ctx context.Context, owner Owner, diffs []Diff) error
+}
+
+// Waiter is an optional driver capability: block until the objects it
+// was asked about are ready. The engine type-asserts Driver to Waiter
+// and only waits when ExecutorOptions.Wait is set, so drivers without
+// the capability (fake) keep working unchanged.
+type Waiter interface {
+	// Wait polls until every object in objs is ready or the wait ends.
+	// timeout <= 0 means no deadline — the caller's context bounds the
+	// wait. It returns nil when all objects are ready, an error naming
+	// an object that failed or disappeared, ctx.Err() on cancellation,
+	// and a timeout error when timeout > 0 elapses first.
+	Wait(ctx context.Context, owner Owner, objs []Object, timeout time.Duration) error
 }
 
 // ErrForeignOwner reports a desired object whose live instance carries

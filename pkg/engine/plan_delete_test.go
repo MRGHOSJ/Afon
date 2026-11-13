@@ -122,3 +122,39 @@ func TestPlan_SummaryDeleteFirst(t *testing.T) {
 		t.Errorf("summary order must be delete, create, update:\n%s", out)
 	}
 }
+
+// TestPlan_DeleteObjectCount: the prompt's count walks OpDelete diffs
+// across every entry shape — single-diff, mixed batch, create-only,
+// diff-less — and never reads Summary, whose entry count undercounts a
+// batch where deletes share a node with creates (the demo's 4-object
+// batch reported 1 entry).
+func TestPlan_DeleteObjectCount(t *testing.T) {
+	od := func(op driver.Op, name string) driver.Diff {
+		return driver.Diff{Op: op, Object: driver.Object{Kind: "Service", Name: name}}
+	}
+	p := &Plan{
+		Flow: "x",
+		Entries: []PlanEntry{
+			{NodeID: "one", Kind: KindResource, Status: PlanDelete,
+				Diff: &driver.Diff{Op: driver.OpDelete, Object: driver.Object{Kind: "Service", Name: "solo"}}},
+			{NodeID: "batch", Kind: KindResource, Status: PlanDelete, Diffs: []driver.Diff{
+				od(driver.OpCreate, "new-a"),
+				od(driver.OpDelete, "old-a"),
+				od(driver.OpDelete, "old-b"),
+				od(driver.OpUpdate, "mid"),
+			}},
+			{NodeID: "fresh", Kind: KindResource, Status: PlanCreate,
+				Diff: &driver.Diff{Op: driver.OpCreate, Object: driver.Object{Kind: "ConfigMap", Name: "hello"}}},
+			{NodeID: "act", Kind: KindAction, Status: PlanCached, Key: "abcdef1234567890"},
+		},
+		// Entry-count summary: 2 delete entries, 1 create — must NOT
+		// be what the count reads.
+		Summary: map[string]int{PlanDelete: 2, PlanCreate: 1},
+	}
+	if got, want := p.DeleteObjectCount(), 3; got != want {
+		t.Errorf("DeleteObjectCount() = %d, want %d", got, want)
+	}
+	if got := (&Plan{}).DeleteObjectCount(); got != 0 {
+		t.Errorf("empty plan DeleteObjectCount() = %d, want 0", got)
+	}
+}

@@ -25,6 +25,10 @@ var (
 	svcGVR    = schema.GroupVersionResource{Version: "v1", Resource: "services"}
 	cmGVR     = schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}
 	deployGVR = schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
+	stsGVR    = schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "statefulsets"}
+	dsGVR     = schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "daemonsets"}
+	jobGVR    = schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "jobs"}
+	podGVR    = schema.GroupVersionResource{Version: "v1", Resource: "pods"}
 )
 
 const (
@@ -81,9 +85,13 @@ func namespaced(group, version, kind, resource string) *meta.RESTMapping {
 
 func testMapper() staticMapper {
 	return staticMapper{
-		{Version: "v1", Kind: "ConfigMap"}:                 namespaced("", "v1", "ConfigMap", "configmaps"),
-		{Version: "v1", Kind: "Service"}:                   namespaced("", "v1", "Service", "services"),
-		{Group: "apps", Version: "v1", Kind: "Deployment"}: namespaced("apps", "v1", "Deployment", "deployments"),
+		{Version: "v1", Kind: "ConfigMap"}:                  namespaced("", "v1", "ConfigMap", "configmaps"),
+		{Version: "v1", Kind: "Service"}:                    namespaced("", "v1", "Service", "services"),
+		{Version: "v1", Kind: "Pod"}:                        namespaced("", "v1", "Pod", "pods"),
+		{Group: "apps", Version: "v1", Kind: "Deployment"}:  namespaced("apps", "v1", "Deployment", "deployments"),
+		{Group: "apps", Version: "v1", Kind: "StatefulSet"}: namespaced("apps", "v1", "StatefulSet", "statefulsets"),
+		{Group: "apps", Version: "v1", Kind: "DaemonSet"}:   namespaced("apps", "v1", "DaemonSet", "daemonsets"),
+		{Group: "batch", Version: "v1", Kind: "Job"}:        namespaced("batch", "v1", "Job", "jobs"),
 		{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"}: {
 			GroupVersionKind: schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"},
 			Resource:         schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"},
@@ -209,6 +217,7 @@ func newTestDriverOpts(t *testing.T, force, prune bool, conflicts map[string]str
 	t.Helper()
 	listKinds := map[schema.GroupVersionResource]string{
 		cmGVR: "ConfigMapList", svcGVR: "ServiceList", deployGVR: "DeploymentList",
+		stsGVR: "StatefulSetList", dsGVR: "DaemonSetList", jobGVR: "JobList", podGVR: "PodList",
 	}
 	dyn := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds, seeds...)
 	installSSAFake(dyn, conflicts)

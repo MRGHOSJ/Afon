@@ -290,6 +290,28 @@ func (p *Plan) RenderText() string {
 	return b.String()
 }
 
+// DeleteObjectCount reports how many objects the plan will destroy:
+// OpDelete diffs across every entry, counting single-diff entries and
+// multi-object batches alike. The summary footer counts entries by
+// status — a mixed create+delete batch contributes one "delete" entry
+// no matter how many objects it deletes — so the confirmation prompt
+// must not read Summary: telling the operator "1 object" while two
+// die is exactly the failure the prompt exists to prevent.
+func (p *Plan) DeleteObjectCount() int {
+	n := 0
+	for _, e := range p.Entries {
+		if e.Diff != nil && e.Diff.Op == driver.OpDelete {
+			n++
+		}
+		for _, df := range e.Diffs {
+			if df.Op == driver.OpDelete {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 func orNone2(s string) string {
 	if s == "" {
 		return "in-memory"

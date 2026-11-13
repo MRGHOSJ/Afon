@@ -13,12 +13,7 @@ spec:
         image: nginx:1.27-alpine
         port: 8080
         out: generated.yaml
-    - id: manifests
-      type: k8s-manifests
-      config:
-        paths:
-          - generated.yaml
     - id: deploy
       type: k8s-apply
       config:
-        manifests: ${manifests.rendered}
+        manifests: ${app.rendered}

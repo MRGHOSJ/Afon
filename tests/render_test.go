@@ -86,10 +86,14 @@ func TestCLIRenderLifecycle(t *testing.T) {
 	}
 
 	// 2. plan reads the file: action entry is "file", downstream gets a
-	// real diff (not known-after-apply), no staleness warning yet.
+	// real diff (not known-after-apply), no staleness warning yet. The
+	// text plan opens with the driver header.
 	r = runAf(t, nil, "plan", "-f", flow)
 	if r.code != 0 {
 		t.Fatalf("plan exit = %d\nstderr: %s", r.code, r.stderr)
+	}
+	if !strings.HasPrefix(r.stdout, "driver: fake\n") {
+		t.Errorf("plan stdout must start with the driver header:\n%.80q", r.stdout)
 	}
 	if !strings.Contains(r.stdout, "file") {
 		t.Errorf("plan missing file status:\n%s", r.stdout)
@@ -190,4 +194,84 @@ func TestCLIPlanNoImplicitRender(t *testing.T) {
 	r = runAf(t, nil, "apply", "-f", flow)
 	wantExit(t, r, "apply", "-f", flow)
 	wantStderrContains(t, r, "missing", `run "afon render" first`)
+}
+
+// TestCLIRenderCheckExit pins --check's exit contract on the real
+// binary: exit 0 only when every file is up-to-date; a flow edit
+// (stale), a hand-edited body, and a deleted file each exit 1 naming
+// the count — and check never writes.
+func TestCLIRenderCheckExit(t *testing.T) {
+	flow := writeRenderFlow(t, "nginx:1.27-alpine")
+	dir := filepath.Dir(flow)
+	appPath := filepath.Join(dir, "gen", "app.yaml")
+
+	if r := runAf(t, nil, "render", "-f", flow); r.code != 0 {
+		t.Fatalf("render exit = %d\nstderr: %s", r.code, r.stderr)
+	}
+	before := mustReadFile(t, appPath)
+
+	// Current: exit 0, up-to-date reported on stderr.
+	r := runAf(t, nil, "render", "--check", "-f", flow)
+	if r.code != 0 {
+		t.Fatalf("check (current) exit = %d, want 0\nstderr: %s", r.code, r.stderr)
+	}
+	wantStderrContains(t, r, "up-to-date")
+
+	// Stale: flow edited after render → exit 1, count error, no write.
+	// (stdout carries the would-be content like terraform fmt -check, so
+	// assert the code directly instead of via wantExit's empty-stdout rule.)
+	flowEdited := strings.Replace(mustReadFile(t, flow), "nginx:1.27-alpine", "nginx:1.28", 1)
+	if err := os.WriteFile(flow, []byte(flowEdited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r = runAf(t, nil, "render", "--check", "-f", flow)
+	if r.code != 1 {
+		t.Errorf("check (stale) exit = %d, want 1\nstderr: %s", r.code, r.stderr)
+	}
+	wantStderrContains(t, r, "stale", "render --check: 1 file(s) not up to date")
+	if got := mustReadFile(t, appPath); got != before {
+		t.Error("--check modified the file on stale")
+	}
+
+	// Edited: hand-edited body → exit 1, file left as-is.
+	if err := os.WriteFile(flow, []byte(strings.Replace(flowEdited, "nginx:1.28", "nginx:1.27-alpine", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handEdited := strings.Replace(before, "image: nginx:1.27-alpine", "image: nginx:evil", 1)
+	if err := os.WriteFile(appPath, []byte(handEdited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r = runAf(t, nil, "render", "--check", "-f", flow)
+	if r.code != 1 {
+		t.Errorf("check (edited) exit = %d, want 1\nstderr: %s", r.code, r.stderr)
+	}
+	wantStderrContains(t, r, "edited", "render --check: 1 file(s) not up to date")
+	if got := mustReadFile(t, appPath); got != handEdited {
+		t.Error("--check modified the hand-edited file")
+	}
+
+	// Missing: deleted file → exit 1, nothing recreated.
+	if err := os.Remove(appPath); err != nil {
+		t.Fatal(err)
+	}
+	r = runAf(t, nil, "render", "--check", "-f", flow)
+	if r.code != 1 {
+		t.Errorf("check (missing) exit = %d, want 1\nstderr: %s", r.code, r.stderr)
+	}
+	wantStderrContains(t, r, "missing", "render --check: 1 file(s) not up to date")
+	if _, err := os.Stat(appPath); !os.IsNotExist(err) {
+		t.Error("--check recreated the missing file")
+	}
+
+	// Non-check render still exits 0 on the stale flow (warnings only).
+	if err := os.WriteFile(appPath, []byte(before), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	flowStale := strings.Replace(mustReadFile(t, flow), "nginx:1.27-alpine", "nginx:1.29", 1)
+	if err := os.WriteFile(flow, []byte(flowStale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := runAf(t, nil, "render", "-f", flow); r.code != 0 {
+		t.Errorf("plain render on stale flow exit = %d, want 0\nstderr: %s", r.code, r.stderr)
+	}
 }

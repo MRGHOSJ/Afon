@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/MRGHOSJ/afon/pkg/driver"
 	"golang.org/x/sync/errgroup"
@@ -15,6 +16,13 @@ import (
 type ExecutorOptions struct {
 	// Parallelism caps concurrent nodes (CLI --parallelism, default 4).
 	Parallelism int
+	// Wait blocks each resource node until the objects it created or
+	// updated are ready (CLI --no-wait disables). Drivers that do not
+	// implement driver.Waiter never wait.
+	Wait bool
+	// WaitTimeout bounds each wait (CLI --wait-timeout, default 5m);
+	// <= 0 means no deadline — the apply context bounds the wait.
+	WaitTimeout time.Duration
 }
 
 // runState is the shared mutable state of one Apply: the dependency
@@ -63,7 +71,10 @@ func (s *runState) complete(id string, r NodeResult) []string {
 //   - a cache hit short-circuits Run and marks the result Cached
 //     (engine rule 1: a plan's will-run is an upper bound);
 //   - a cache write happens only after a successful Run (rule 4);
-//   - a cancelled node records cancelled, not failed.
+//   - a cancelled node records cancelled, not failed;
+//   - when opts.Wait is set and the driver implements driver.Waiter,
+//     each resource node waits for the objects it created or updated
+//     before completing (rule: wait failures fail the node).
 func Apply(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driver, opts ExecutorOptions) (*RunResult, error) {
 	if opts.Parallelism <= 0 {
 		opts.Parallelism = 4
@@ -112,7 +123,7 @@ func Apply(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driver, 
 	launch := func(id string) {
 		launched++
 		g.Go(func() error {
-			out := runNode(gctx, cf, id, st.res, store, d)
+			out := runNode(gctx, cf, id, st.res, store, d, opts)
 			ready := st.complete(id, out)
 			if out.Status == StatusFailed {
 				// Returning the error cancels gctx: no further scheduling,
@@ -197,8 +208,8 @@ func Apply(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driver, 
 
 // runNode executes one node and returns its terminal result. It never
 // writes the cache on failure (engine rule 4) and distinguishes cancelled
-// from failed.
-func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, store Store, d driver.Driver) NodeResult {
+// from failed. opts carries the wait policy into resource nodes.
+func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, store Store, d driver.Driver, opts ExecutorOptions) NodeResult {
 	cn, ok := cf.Node(id)
 	if !ok {
 		return NodeResult{NodeID: id, Status: StatusFailed, Err: fmt.Errorf("internal: unknown node %q", id)}
@@ -295,6 +306,21 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 				}
 				return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: err}
 			}
+			// Wait only for objects that came to life or changed —
+			// deletes and none-diffs have nothing to become ready.
+			if opts.Wait {
+				if w, ok := d.(driver.Waiter); ok {
+					if objs := waitedObjects(changed); len(objs) > 0 {
+						if err := w.Wait(ctx, owner, objs, opts.WaitTimeout); err != nil {
+							if ctx.Err() != nil {
+								return NodeResult{NodeID: cn.ID, Status: StatusCancelled, Err: ctx.Err()}
+							}
+							return NodeResult{NodeID: cn.ID, Status: StatusFailed,
+								Err: fmt.Errorf("wait: %w", err)}
+						}
+					}
+				}
+			}
 		}
 		return NodeResult{NodeID: cn.ID, Status: StatusSucceeded,
 			DiffCount: len(changed), Detail: formatChanges(changed)}
@@ -306,6 +332,19 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 			Err:    fmt.Errorf("node type %q implements neither ActionType nor ResourceType", cn.Type),
 		}
 	}
+}
+
+// waitedObjects lifts the create/update diffs out of an applied batch —
+// exactly the objects a Waiter should poll. Deletes and none-diffs are
+// dropped: there is nothing to wait for.
+func waitedObjects(changed []driver.Diff) []driver.Object {
+	objs := make([]driver.Object, 0, len(changed))
+	for _, df := range changed {
+		if df.Op == driver.OpCreate || df.Op == driver.OpUpdate {
+			objs = append(objs, df.Object)
+		}
+	}
+	return objs
 }
 
 // formatChanges summarizes the changed diffs a resource node applied:

@@ -83,18 +83,27 @@ func runRender(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	printRenderResult(res)
+	notUpToDate := printRenderResult(res)
+	if flagRenderCheck && notUpToDate > 0 {
+		return fmt.Errorf("render --check: %d file(s) not up to date", notUpToDate)
+	}
 	return nil
 }
 
 // printRenderResult sends status lines to stderr so stdout stays a
 // clean YAML stream: file contents (header included) in topological
 // order, then the bare outputs of ephemeral action nodes that ran
-// without writing anything.
-func printRenderResult(res *engine.RenderResult) {
+// without writing anything. It returns how many files were not
+// up-to-date — the count --check turns into a non-zero exit: every
+// status except up-to-date and unchanged (written only appears when
+// not checking, where runRender ignores the count).
+func printRenderResult(res *engine.RenderResult) (notUpToDate int) {
 	written := map[string]bool{}
 	for _, f := range res.Files {
 		written[f.NodeID] = true
+		if f.Status != engine.FileUpToDate && f.Status != engine.FileUnchanged {
+			notUpToDate++
+		}
 		fmt.Fprintf(os.Stderr, "%s: node %s → %s\n", f.Status, f.NodeID, f.Path)
 		if f.Diff != "" {
 			for _, line := range splitLines(f.Diff) {
@@ -124,6 +133,7 @@ func printRenderResult(res *engine.RenderResult) {
 		}
 		fmt.Fprintf(os.Stderr, "node %s: ephemeral, nothing written\n", id)
 	}
+	return notUpToDate
 }
 
 func splitLines(s string) []string {

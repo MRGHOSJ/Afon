@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/MRGHOSJ/afon/pkg/driver"
 	"github.com/MRGHOSJ/afon/pkg/driver/fake"
@@ -25,7 +28,21 @@ var (
 	flagForceConflicts bool
 	flagNoPrune        bool
 	flagShowRendered   bool
+	flagAutoApprove    bool
+	flagNoWait         bool
+	flagWaitTimeout    time.Duration
 )
+
+// stdinIsTerminal reports whether stdin is an interactive terminal.
+// It is a variable so tests can inject a TTY (or a pipe) without
+// touching the real process stdin.
+var stdinIsTerminal = func() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
 
 // notifyContext wraps context cancellation in a signal handler (SIGINT /
 // SIGTERM → cancel). It is a variable so tests can inject a context they
@@ -66,6 +83,12 @@ func newApplyCmd() *cobra.Command {
 	addFlowFlags(cmd)
 	cmd.Flags().BoolVar(&flagShowRendered, "show-rendered", false,
 		"print each known action output from the plan to stderr before executing")
+	cmd.Flags().BoolVar(&flagAutoApprove, "auto-approve", false,
+		"skip the delete-confirmation prompt (no effect when the plan has no deletes)")
+	cmd.Flags().BoolVar(&flagNoWait, "no-wait", false,
+		"do not wait for created/updated objects to become ready")
+	cmd.Flags().DurationVar(&flagWaitTimeout, "wait-timeout", 5*time.Minute,
+		"how long to wait for created/updated objects to become ready (0 = wait indefinitely)")
 	return cmd
 }
 
@@ -88,29 +111,53 @@ func addFlowFlags(cmd *cobra.Command) {
 // the flow's target namespace (it manages exactly one) and a context
 // that --context and target.context agree on; it then banners which
 // cluster and namespace it is about to touch, after the kubeconfig
-// loads and before any connection is attempted.
-func buildDriver(stateDir string, target schema.Target) (driver.Driver, error) {
+// loads and before any connection is attempted. The returned context
+// name (empty for fake) feeds the plan header.
+func buildDriver(stateDir string, target schema.Target) (driver.Driver, string, error) {
 	switch flagDriver {
 	case "fake":
 		fmt.Fprintln(os.Stderr, "fake driver: no cluster is touched")
-		return fake.NewPersistent(fakeStatePath(stateDir))
+		d, err := fake.NewPersistent(fakeStatePath(stateDir))
+		return d, "", err
 	case "k8s":
 		if target.Namespace == "" {
-			return nil, fmt.Errorf("the k8s driver needs spec.target.namespace in the flow")
+			return nil, "", fmt.Errorf("the k8s driver needs spec.target.namespace in the flow")
 		}
 		ctxName, err := resolveContext(kubeContext, target.Context)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		restCfg, err := clientConfigFor(ctxName).ClientConfig()
 		if err != nil {
-			return nil, kubeconfigError(err)
+			return nil, "", kubeconfigError(err)
 		}
 		fmt.Fprintf(os.Stderr, "k8s driver: context=%s namespace=%s\n", ctxName, target.Namespace)
-		return k8s.NewFromConfig(restCfg, target.Namespace, flagForceConflicts, !flagNoPrune)
+		d, err := k8s.NewFromConfig(restCfg, target.Namespace, flagForceConflicts, !flagNoPrune)
+		return d, ctxName, err
 	default:
-		return nil, fmt.Errorf("unknown driver %q (available: fake, k8s)", flagDriver)
+		return nil, "", fmt.Errorf("unknown driver %q (available: fake, k8s)", flagDriver)
 	}
+}
+
+// printPlanHeader writes the plan's one-line header to stdout before
+// the plan body — text mode only, so -o json output stays a single
+// parseable document. It names the driver and, for k8s, the exact
+// cluster, namespace, and flag state the plan ran with.
+func printPlanHeader(driverName, ctxName string, cf *engine.CompiledFlow) {
+	if driverName != "k8s" {
+		fmt.Printf("driver: %s\n", driverName)
+		return
+	}
+	force := "off"
+	if flagForceConflicts {
+		force = "on"
+	}
+	prune := "off"
+	if !flagNoPrune {
+		prune = "on"
+	}
+	fmt.Printf("driver: k8s context: %s namespace: %s force: %s prune: %s\n",
+		ctxName, cf.Target.Namespace, force, prune)
 }
 
 func openFlow() (*engine.CompiledFlow, engine.Store, string, error) {
@@ -137,7 +184,7 @@ func runPlan(ctx context.Context) error {
 	if err := warnStaleMaterialized(cf); err != nil {
 		return err
 	}
-	d, err := buildDriver(stateDir, cf.Target)
+	d, ctxName, err := buildDriver(stateDir, cf.Target)
 	if err != nil {
 		return err
 	}
@@ -153,6 +200,7 @@ func runPlan(ctx context.Context) error {
 		fmt.Println(string(out))
 		return nil
 	}
+	printPlanHeader(flagDriver, ctxName, cf)
 	fmt.Print(p.RenderText())
 	return nil
 }
@@ -165,7 +213,7 @@ func runApply(ctx context.Context) error {
 	if err := warnStaleMaterialized(cf); err != nil {
 		return err
 	}
-	d, err := buildDriver(stateDir, cf.Target)
+	d, ctxName, err := buildDriver(stateDir, cf.Target)
 	if err != nil {
 		return err
 	}
@@ -177,15 +225,21 @@ func runApply(ctx context.Context) error {
 		return err
 	}
 	if flagOutput != "json" {
+		printPlanHeader(flagDriver, ctxName, cf)
 		fmt.Print(p.RenderText())
 		fmt.Println()
 	}
 	if flagShowRendered {
 		printActionOutputs(p)
 	}
+	if err := confirmDeletes(p); err != nil {
+		return err
+	}
 
 	res, err := engine.Apply(ctx, cf, store, d, engine.ExecutorOptions{
 		Parallelism: flagParallelism,
+		Wait:        !flagNoWait,
+		WaitTimeout: flagWaitTimeout,
 	})
 	// Results print even when Apply returns an error (e.g. a cancelled
 	// run): the per-node statuses are the point of the output.
@@ -217,6 +271,34 @@ func warnStaleMaterialized(cf *engine.CompiledFlow) error {
 			w.NodeID, w.Path, flagFlowFile)
 	}
 	return nil
+}
+
+// confirmDeletes gates apply on an explicit yes when the plan will
+// delete objects. The count is the plan's OpDelete diffs — the actual
+// objects that will be destroyed — not the summary's entry count: a
+// mixed create+delete batch is one "delete" entry in the summary but
+// several dead objects, and the prompt must never undercount those.
+// Non-interactive stdin (pipes, CI) refuses instead of guessing: the
+// operator opts in with --auto-approve. The prompt goes to stderr so
+// -o json stdout stays a single clean document.
+func confirmDeletes(p *engine.Plan) error {
+	n := p.DeleteObjectCount()
+	if n == 0 || flagAutoApprove {
+		return nil
+	}
+	if !stdinIsTerminal() {
+		return fmt.Errorf("plan contains %d delete(s) and stdin is not interactive; pass --auto-approve to apply without confirmation", n)
+	}
+	fmt.Fprintf(os.Stderr, "plan deletes %d object(s); apply these changes? [y/N] ", n)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("reading confirmation: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return nil
+	}
+	return fmt.Errorf("apply aborted")
 }
 
 // printActionOutputs dumps the plan's known action outputs to stderr —

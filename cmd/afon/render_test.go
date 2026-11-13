@@ -168,14 +168,15 @@ func TestRender_CheckAndStale(t *testing.T) {
 		t.Errorf("check stderr = %s, want up-to-date", stderr)
 	}
 
-	// Change the flow config: the file is now stale, not edited.
+	// Change the flow config: the file is now stale, not edited — and
+	// --check must fail on it.
 	stale := strings.ReplaceAll(string(mustRead(t, flow)), "nginx:1.27-alpine", "nginx:1.28")
 	if err := os.WriteFile(flow, []byte(stale), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, stderr, err = captureStdoutStderr(t, func() error { return runRender(context.Background()) })
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "render --check: 1 file(s) not up to date") {
+		t.Errorf("stale check err = %v, want render --check count error", err)
 	}
 	if !strings.Contains(stderr, "stale") || !strings.Contains(stderr, "flow config changed since render") {
 		t.Errorf("stale check stderr = %s", stderr)
@@ -184,6 +185,87 @@ func TestRender_CheckAndStale(t *testing.T) {
 	if string(after) != string(before) {
 		t.Error("--check modified the file")
 	}
+}
+
+// TestRender_CheckExitCode: --check exits nil only when every file is
+// up-to-date; stale, edited, and missing files each fail with the
+// count error and modify nothing.
+func TestRender_CheckExitCode(t *testing.T) {
+	flow := writeRenderFlow(t, "nginx:1.27-alpine")
+	resetRenderFlags(t, flow)
+	if _, _, err := captureStdoutStderr(t, func() error { return runRender(context.Background()) }); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(filepath.Dir(flow), "gen", "app.yaml")
+	before := string(mustRead(t, path))
+	flagRenderCheck = true
+
+	t.Run("current", func(t *testing.T) {
+		_, stderr, err := captureStdoutStderr(t, func() error { return runRender(context.Background()) })
+		if err != nil {
+			t.Fatalf("up-to-date check err = %v, want nil", err)
+		}
+		if !strings.Contains(stderr, "up-to-date") {
+			t.Errorf("stderr = %s, want up-to-date", stderr)
+		}
+	})
+
+	t.Run("stale", func(t *testing.T) {
+		stale := strings.ReplaceAll(string(mustRead(t, flow)), "nginx:1.27-alpine", "nginx:1.28")
+		if err := os.WriteFile(flow, []byte(stale), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.WriteFile(flow, []byte(strings.ReplaceAll(stale, "nginx:1.28", "nginx:1.27-alpine")), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		})
+		_, _, err := captureStdoutStderr(t, func() error { return runRender(context.Background()) })
+		if err == nil || !strings.Contains(err.Error(), "render --check: 1 file(s) not up to date") {
+			t.Errorf("err = %v, want render --check count error", err)
+		}
+		if got := string(mustRead(t, path)); got != before {
+			t.Error("--check modified the file")
+		}
+	})
+
+	t.Run("edited", func(t *testing.T) {
+		b := string(mustRead(t, path))
+		handEdited := strings.Replace(b, "image: nginx:1.27-alpine", "image: nginx:evil", 1)
+		if err := os.WriteFile(path, []byte(handEdited), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.WriteFile(path, []byte(b), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		})
+		_, _, err := captureStdoutStderr(t, func() error { return runRender(context.Background()) })
+		if err == nil || !strings.Contains(err.Error(), "render --check: 1 file(s) not up to date") {
+			t.Errorf("err = %v, want render --check count error", err)
+		}
+		if got := string(mustRead(t, path)); got != handEdited {
+			t.Error("--check modified the hand-edited file")
+		}
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.WriteFile(path, []byte(before), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		})
+		_, _, err := captureStdoutStderr(t, func() error { return runRender(context.Background()) })
+		if err == nil || !strings.Contains(err.Error(), "render --check: 1 file(s) not up to date") {
+			t.Errorf("err = %v, want render --check count error", err)
+		}
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Error("--check recreated the missing file")
+		}
+	})
 }
 
 // TestRender_RefusesHandEditThenForce: a hand-edited body blocks a

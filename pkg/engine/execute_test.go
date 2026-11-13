@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -455,4 +458,265 @@ func compileWith(t *testing.T, src string, reg *Registry) (*CompiledFlow, error)
 		return nil, err
 	}
 	return Compile(flow, reg)
+}
+
+// --- wait wiring (Stage 4d) ---------------------------------------------
+
+// scriptedDriver answers Plan from a fixed name→op map (so tests can
+// produce create/update/none/delete diffs the fake driver never emits)
+// and records Apply. It deliberately does NOT implement driver.Waiter.
+type scriptedDriver struct {
+	mu      sync.Mutex
+	ops     map[string]driver.Op
+	applied [][]driver.Diff
+}
+
+func (d *scriptedDriver) Plan(ctx context.Context, owner driver.Owner, desired []driver.Object) ([]driver.Diff, error) {
+	diffs := make([]driver.Diff, 0, len(desired))
+	for _, o := range desired {
+		op, ok := d.ops[o.Name]
+		if !ok {
+			op = driver.OpCreate
+		}
+		diffs = append(diffs, driver.Diff{Object: o, Op: op})
+	}
+	return diffs, nil
+}
+
+func (d *scriptedDriver) Apply(ctx context.Context, owner driver.Owner, diffs []driver.Diff) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.applied = append(d.applied, diffs)
+	return nil
+}
+
+// waitCall records one Wait invocation.
+type waitCall struct {
+	owner   driver.Owner
+	objs    []driver.Object
+	timeout time.Duration
+}
+
+// waitDriver adds the Waiter capability on top of scriptedDriver.
+type waitDriver struct {
+	*scriptedDriver
+	mu      sync.Mutex
+	waits   []waitCall
+	waitErr error
+}
+
+func (d *waitDriver) Wait(ctx context.Context, owner driver.Owner, objs []driver.Object, timeout time.Duration) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.waits = append(d.waits, waitCall{owner: owner, objs: objs, timeout: timeout})
+	return d.waitErr
+}
+
+func (d *waitDriver) waitOwners() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]string, 0, len(d.waits))
+	for _, w := range d.waits {
+		out = append(out, w.owner.Node)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func waitObj(name string) driver.Object {
+	return driver.Object{Kind: "ConfigMap", Namespace: "demo", Name: name,
+		Data: map[string]any{"k": name}}
+}
+
+// waitFlow has two resource nodes (multi-object desired sets) and a
+// dependent tail — enough to observe per-node waits and skip behavior.
+const waitFlow = `apiVersion: afon.dev/flow/v1
+kind: Flow
+metadata: {name: wait}
+spec:
+  nodes:
+    - id: r1
+      type: res1
+      config: {}
+    - id: r2
+      type: res2
+      config: {}
+    - id: tail
+      type: tail
+      needs: [r1]
+      config: {}
+`
+
+// resNodeType is a resource-only node type: Desired but deliberately no
+// Run, so the executor's type switch lands on ResourceType (testNodeType
+// implements both interfaces and would dispatch as an action).
+type resNodeType struct {
+	name string
+	objs []driver.Object
+}
+
+func (r *resNodeType) Type() string              { return r.name }
+func (r *resNodeType) TypeVersion() string       { return "1" }
+func (r *resNodeType) Kind() Kind                { return KindResource }
+func (r *resNodeType) Validate(cfg any) error    { return nil }
+func (r *resNodeType) DeclaredOutputs() []string { return nil }
+func (r *resNodeType) Desired(ctx context.Context, cfg any, in Inputs) ([]driver.Object, error) {
+	return r.objs, nil
+}
+
+// waitFixture builds the flow plus a scripted ops map:
+// r1 desires a(create) b(none) c(delete); r2 desires d(update) e(none).
+func waitFixture(t *testing.T, ops map[string]driver.Op) (*CompiledFlow, *waitDriver, *testNodeType) {
+	t.Helper()
+	res1 := &resNodeType{name: "res1", objs: []driver.Object{waitObj("a"), waitObj("b"), waitObj("c")}}
+	res2 := &resNodeType{name: "res2", objs: []driver.Object{waitObj("d"), waitObj("e")}}
+	tail := &testNodeType{name: "tail", kind: KindAction, outputs: []string{},
+		run: func(ctx context.Context, cfg any, in Inputs) (Outputs, error) {
+			return Outputs{}, nil
+		}}
+	reg := NewRegistry()
+	for _, nt := range []NodeType{res1, res2, tail} {
+		if err := reg.Register(nt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	flow, err := compileWith(t, waitFlow, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &waitDriver{scriptedDriver: &scriptedDriver{ops: ops}}
+	return flow, d, tail
+}
+
+// TestExecutor_WaitReceivesCreatedObjects: with Wait enabled, each
+// resource node waits after a successful Apply with exactly its
+// create/update objects (none- and delete-diffs filtered out) and the
+// configured timeout passed through unchanged — including 0, which
+// means "no deadline" (the Waiter contract).
+func TestExecutor_WaitReceivesCreatedObjects(t *testing.T) {
+	for _, timeout := range []time.Duration{5 * time.Minute, 0} {
+		t.Run(fmt.Sprintf("timeout_%s", timeout), func(t *testing.T) {
+			ops := map[string]driver.Op{
+				"a": driver.OpCreate, "b": driver.OpNone, "c": driver.OpDelete,
+				"d": driver.OpUpdate, "e": driver.OpNone,
+			}
+			flow, d, _ := waitFixture(t, ops)
+			res, err := Apply(context.Background(), flow, NewMemoryStore(), d,
+				ExecutorOptions{Wait: true, WaitTimeout: timeout})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := d.waitOwners(); !reflect.DeepEqual(got, []string{"r1", "r2"}) {
+				t.Fatalf("waited nodes = %v, want [r1 r2]", got)
+			}
+			// Per-node objects, collected by owner (parallel nodes append
+			// in nondeterministic order).
+			byNode := map[string][]string{}
+			for _, w := range d.waits {
+				if w.timeout != timeout {
+					t.Errorf("node %s wait timeout = %v, want %v", w.owner.Node, w.timeout, timeout)
+				}
+				var names []string
+				for _, o := range w.objs {
+					switch o.Name {
+					case "a", "d": // the create/update each node produced
+					default:
+						t.Errorf("node %s waited on %s (none/delete must be filtered)", w.owner.Node, o.Name)
+					}
+					names = append(names, o.Name)
+				}
+				byNode[w.owner.Node] = names
+			}
+			// r1 waited only on a; r2 only on d.
+			if got := byNode["r1"]; !reflect.DeepEqual(got, []string{"a"}) {
+				t.Errorf("r1 waited objects = %v, want [a]", got)
+			}
+			if got := byNode["r2"]; !reflect.DeepEqual(got, []string{"d"}) {
+				t.Errorf("r2 waited objects = %v, want [d]", got)
+			}
+			// Both nodes succeeded; the dependent tail ran.
+			snap := res.Snapshot()
+			for _, id := range []string{"r1", "r2", "tail"} {
+				if r := snap[id]; r.Status != StatusSucceeded {
+					t.Errorf("node %s = %s, want succeeded", id, r.Status)
+				}
+			}
+		})
+	}
+}
+
+// TestExecutor_WaitDisabledOrNoChangesNeverWaits: Wait:false skips the
+// hook even on a Waiter driver; an all-none plan has nothing to wait
+// for; a driver without the Waiter capability is never type-asserted
+// into one (no panic, no wait).
+func TestExecutor_WaitDisabledOrNoChangesNeverWaits(t *testing.T) {
+	t.Run("wait disabled", func(t *testing.T) {
+		ops := map[string]driver.Op{"a": driver.OpCreate, "d": driver.OpUpdate}
+		flow, d, _ := waitFixture(t, ops)
+		if _, err := Apply(context.Background(), flow, NewMemoryStore(), d,
+			ExecutorOptions{Wait: false, WaitTimeout: time.Minute}); err != nil {
+			t.Fatal(err)
+		}
+		if n := len(d.waits); n != 0 {
+			t.Errorf("wait calls = %d, want 0", n)
+		}
+	})
+
+	t.Run("all none", func(t *testing.T) {
+		ops := map[string]driver.Op{"a": driver.OpNone, "b": driver.OpNone, "c": driver.OpNone,
+			"d": driver.OpNone, "e": driver.OpNone}
+		flow, d, _ := waitFixture(t, ops)
+		if _, err := Apply(context.Background(), flow, NewMemoryStore(), d,
+			ExecutorOptions{Wait: true, WaitTimeout: time.Minute}); err != nil {
+			t.Fatal(err)
+		}
+		if n := len(d.waits); n != 0 {
+			t.Errorf("wait calls = %d, want 0 for an all-none plan", n)
+		}
+	})
+
+	t.Run("driver without Waiter", func(t *testing.T) {
+		ops := map[string]driver.Op{"a": driver.OpCreate, "d": driver.OpUpdate}
+		flow, _, _ := waitFixture(t, ops)
+		plain := &scriptedDriver{ops: ops}
+		res, err := Apply(context.Background(), flow, NewMemoryStore(), plain,
+			ExecutorOptions{Wait: true, WaitTimeout: time.Minute})
+		if err != nil {
+			t.Fatalf("Waiter-less driver with Wait:true must not fail: %v", err)
+		}
+		if r, _ := res.Get("r1"); r.Status != StatusSucceeded {
+			t.Errorf("r1 = %s, want succeeded", r.Status)
+		}
+	})
+}
+
+// TestExecutor_WaitErrorFailsNode: a Waiter error fails the node with a
+// "wait:" wrap, the dependent is skipped, and Apply reports the failure.
+// Only r1 can wait-fail (r2 is all-none, no Apply → no Wait): a second
+// failing sibling would cancel the group and the loser would record
+// cancelled, per the executor's cancellation convention.
+func TestExecutor_WaitErrorFailsNode(t *testing.T) {
+	ops := map[string]driver.Op{
+		"a": driver.OpCreate, "b": driver.OpNone, "c": driver.OpNone,
+		"d": driver.OpNone, "e": driver.OpNone,
+	}
+	flow, d, _ := waitFixture(t, ops)
+	d.waitErr = errors.New("Deployment/web never became available")
+
+	res, err := Apply(context.Background(), flow, NewMemoryStore(), d,
+		ExecutorOptions{Wait: true, WaitTimeout: time.Minute})
+	if err == nil || !strings.Contains(err.Error(), "wait:") {
+		t.Fatalf("err = %v, want wait: wrap", err)
+	}
+	snap := res.Snapshot()
+	r1 := snap["r1"]
+	if r1.Status != StatusFailed {
+		t.Errorf("r1 = %s, want failed", r1.Status)
+	}
+	if r1.Err == nil || !strings.Contains(r1.Err.Error(), "wait: Deployment/web never became available") {
+		t.Errorf("r1 err = %v, want wrapped wait error", r1.Err)
+	}
+	if r := snap["tail"]; r.Status != StatusSkipped {
+		t.Errorf("tail = %s, want skipped", r.Status)
+	}
 }
