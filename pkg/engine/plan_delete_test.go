@@ -90,8 +90,8 @@ func TestPlan_DeleteStatus(t *testing.T) {
 	if !strings.Contains(text, PlanDelete) {
 		t.Errorf("render must show delete status:\n%s", text)
 	}
-	if !strings.Contains(text, "1 delete") {
-		t.Errorf("summary must count the delete:\n%s", text)
+	if !strings.Contains(text, "1 delete entry") {
+		t.Errorf("summary must count the delete as an entry:\n%s", text)
 	}
 
 	// Apply path: the changed diff formats as "deleted Kind/Name".
@@ -112,7 +112,7 @@ func TestPlan_SummaryDeleteFirst(t *testing.T) {
 		Summary: map[string]int{PlanCreate: 1, PlanDelete: 2, PlanUpdate: 3},
 	}
 	out := p.RenderText()
-	iDel := strings.Index(out, "2 delete")
+	iDel := strings.Index(out, "2 delete entry")
 	iUpd := strings.Index(out, "3 update")
 	iCre := strings.Index(out, "1 create")
 	if iDel < 0 || iCre < 0 || iUpd < 0 {

@@ -23,6 +23,12 @@ func renderTextFixture() *Plan {
 				Diff: &driver.Diff{Op: driver.OpUpdate, Object: driver.Object{Kind: "Deployment", Name: "web"}}},
 			{NodeID: "poison", Kind: KindResource, Status: PlanKnownAfterApply,
 				Reason: "upstream \"act\" did not run"},
+			{NodeID: "batch", Kind: KindResource, Status: PlanDelete, Diffs: []driver.Diff{
+				{Op: driver.OpCreate, Object: driver.Object{Kind: "Deployment", Name: "new"}},
+				{Op: driver.OpCreate, Object: driver.Object{Kind: "Service", Name: "new"}},
+				{Op: driver.OpDelete, Object: driver.Object{Kind: "Deployment", Name: "old"}},
+				{Op: driver.OpDelete, Object: driver.Object{Kind: "Service", Name: "old"}},
+			}},
 			{NodeID: "same", Kind: KindResource, Status: PlanNone,
 				Reason: "already matches"},
 		},
@@ -93,11 +99,15 @@ func TestRenderText_Suffixes(t *testing.T) {
 		"key=abcdef12345",
 		"ConfigMap hello",
 		"Deployment web",
+		"4 changes",
 		`upstream "act" did not run`,
 		"already matches",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "4 objects") {
+		t.Errorf("multi-diff suffix must read \"changes\", not \"objects\":\n%s", out)
 	}
 }

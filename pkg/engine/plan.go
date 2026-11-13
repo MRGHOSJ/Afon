@@ -269,7 +269,7 @@ func (p *Plan) RenderText() string {
 			if e.Diff != nil {
 				line += fmt.Sprintf("  %s %s", e.Diff.Object.Kind, e.Diff.Object.Name)
 			} else if len(e.Diffs) > 0 {
-				line += fmt.Sprintf("  %d objects", len(e.Diffs))
+				line += fmt.Sprintf("  %d changes", len(e.Diffs))
 			}
 		}
 		if e.Reason != "" {
@@ -283,6 +283,14 @@ func (p *Plan) RenderText() string {
 	var parts []string
 	for _, s := range order {
 		if n := p.Summary[s]; n > 0 {
+			// Asymmetric by design: only the delete token is suffixed
+			// " entry" — it is the safety-relevant count and the one
+			// that most misleads when read as objects. Other tokens
+			// are entry counts without the suffix.
+			if s == PlanDelete {
+				parts = append(parts, fmt.Sprintf("%d %s entry", n, s))
+				continue
+			}
 			parts = append(parts, fmt.Sprintf("%d %s", n, s))
 		}
 	}

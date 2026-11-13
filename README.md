@@ -4,7 +4,7 @@
 
 Afon connects to an existing cluster, maps its active infrastructure, and runs an end-to-end delivery pipeline from git to a verified running deployment. Instead of rewriting or replacing your favorite infrastructure utilities, Afon provides a unified framework to drop in third-party tooling—such as security scanners, build engines, and GitOps agents—driven by a local CLI and visualized inside an interactive web control plane.
 
-> **Status: early, learning project.** The local `inspect` command and the Phase 2 flow engine (`validate` / `plan` / `apply` against a fake driver) exist today. The Kubernetes driver, release records, and visual web control plane are still on the roadmap. See [Status](#status) for details.
+> **Status: early, learning project.** `inspect`, the flow engine (`validate` / `render` / `plan` / `apply`), and the Kubernetes driver — server-side plan/apply, owner-scoped pruning, readiness waiting, delete confirmation — exist today. Release records, rollback, pipeline nodes, and the visual web control plane are still on the roadmap. See [Status](#status) for details.
 
 ---
 
@@ -27,8 +27,10 @@ The project explores a highly distinct philosophy meant to combat DevOps toolcha
 |---|---|
 | `afon inspect` (cluster profiling engine) | **Implemented** |
 | `flow.yaml` parser, validation layer & DAG engine | **Implemented** (no cluster: `validate`, `plan`, `apply` on a fake driver) |
-| Plan / apply framework via Server-Side Dry-Runs | Designed, not built |
-| Resilient health-gates, release records & rollbacks | Designed, not built |
+| Materialized manifest rendering (`afon render`, `--check`) | **Implemented** |
+| Kubernetes driver: SSA plan/apply, owner-scoped prune, readiness waiter, delete prompt, plan header | **Implemented** (k3d/kind/k3s) |
+| Release records, health-gated rollback (`history`/`status`/`rollback`) | Designed, not built |
+| Pipeline nodes (`git-source`, `image-build`, `trivy-scan`, Helm) | Planned |
 | Language-agnostic plugin & extension runtime | Planned |
 | Integrated Web UI & real-time topology map (`afon ui`) | Planned |
 | Multi-cluster aggregated control plane agent | Planned |
@@ -57,13 +59,32 @@ afon plan -f flow.yaml       # read-only preview: cached/will-run, create/update
 afon apply -f flow.yaml      # re-plan, then execute; banner confirms no cluster is touched
 ```
 
-Plan statuses: actions report `cached` or `will-run`; resources report `create`, `update`, `none`, or `known-after-apply` when an upstream action's outputs don't exist yet. A plan's `will-run` is an upper bound — apply reports what actually happened, with a per-node detail after the status: `succeeded (cached)`, `succeeded (created ConfigMap/hello)`, or `succeeded (no changes)`.
+Plan statuses: actions report `cached` or `will-run`; resources report `create`, `update`, `delete`, `none`, or `known-after-apply` when an upstream action's outputs don't exist yet. A plan's `will-run` is an upper bound — apply reports what actually happened, with a per-node detail after the status: `succeeded (cached)`, `succeeded (created ConfigMap/hello)`, or `succeeded (no changes)`.
 
 ```bash
 afon plan -f flow.yaml --parallelism 8   # cap concurrent nodes (default 4)
 afon apply -f flow.yaml --state-dir /s   # override state location (default: flow file's dir)
 afon plan -f flow.yaml -o json           # machine-readable plan
 ```
+
+## What works today: Kubernetes (render → plan → apply)
+
+The same engine drives a real cluster through the Kubernetes driver. Work through the runnable example: **[`examples/hello-app`](examples/hello-app)**.
+
+```bash
+afon render -f examples/hello-app/flow.yaml          # materialize generated.yaml (provenance header)
+afon render -f examples/hello-app/flow.yaml --check  # exit 1 if stale; prints the would-be content
+afon plan  -f examples/hello-app/flow.yaml --driver k8s --context k3d-dev
+afon apply -f examples/hello-app/flow.yaml --driver k8s --context k3d-dev
+```
+
+What to know before the first apply:
+
+- **Plan is read-only** — server-side dry-run classification plus a label-scoped LIST for pruning (owner labels `afon.dev/flow` / `afon.dev/node`; objects owned by another flow are refused, never adopted). Prune covers only kinds still present in the flow; a kind removed entirely is left orphaned (Phase 4 inventory closes that).
+- **Text mode prints a header** on stdout after planning: `driver: k8s context: … namespace: … force: off prune: on`. A one-line banner on stderr (`k8s driver: context=… namespace=…`) prints earlier, *before* connecting — it is the only context signal in `-o json` mode and when discovery fails, so both exist on purpose.
+- **Deletes ask first.** If the plan contains deletes, apply prompts `plan deletes N object(s); apply these changes? [y/N]` (N = actual objects, not plan entries). Non-interactive stdin (pipes, CI) refuses instead of guessing — pass `--auto-approve` to proceed.
+- **Apply waits for readiness** — Deployment/StatefulSet/DaemonSet rollouts, Job completion, Pod containers. Default timeout 5m (`--wait-timeout`); `0` means no deadline (the context bounds it); `--no-wait` skips.
+- **Namespace** comes from `spec.target.namespace` in the flow (required for the k8s driver); `--context` overrides `spec.target.context`.
 
 ### What the profile contains
 

@@ -1,6 +1,6 @@
 # Afon design doc
 
-Status: draft v2 · Scope: the thin slice (prebuilt image → plan → apply → wait → release → rollback)
+Status: draft v3 · Scope: the thin slice (prebuilt image → plan → apply → wait → release → rollback), plus the apply safeguards settled before release records
 
 Afon is a remote, cluster-aware delivery pipeline for Kubernetes and k3s. This document fixes four decisions the engine depends on: how nodes behave (action vs. resource), what the cluster profile contains, what a release record stores, and what a flow file looks like. Anything not covered here is out of scope for v1.
 
@@ -167,9 +167,10 @@ spec:
       type: k8s-apply
       config:
         manifests: ${manifests.rendered}
-        wait: { timeout: 120s }
       onFailure: rollback
 ```
+
+(Wait is not a per-node key: `k8s-apply` accepts only `manifests`. Readiness waiting is engine-level — `--wait-timeout` / `--no-wait`, see section 5. `onFailure: rollback` is Phase 4.)
 
 ```go
 type Node struct {
@@ -186,9 +187,21 @@ type Node struct {
 - **Rendering is separate from applying.** `k8s-manifests` renders (Kustomize and Helm become other renderers) and `k8s-apply` applies. Image override is by container name, not YAML templating.
 - **Ownership:** a flow owns the objects it labels. The plan refuses to touch objects owned by another flow.
 
-## 5. Open questions
+## 5. Apply safeguards
+
+These decisions landed with the apply-safeguard stage; each exists to stop a specific accident.
+
+1. **Readiness waiting is driver-reported, engine-gated.** The engine decides *whether* to wait (`ExecutorOptions.Wait` / `WaitTimeout`, fed by the `--wait-timeout` and `--no-wait` flags); the driver reports *when* objects are ready through the additive `driver.Waiter` interface. `timeout <= 0` means no deadline — the context bounds the wait (kubectl semantics). The engine waits only for objects its own create/update diffs produced, and a wait failure fails the node (`wait: …`) before any release could be marked deployed. Unknown kinds are skipped, an object that disappears during the wait is an error, and a `Failed` Job fails immediately with its condition message.
+2. **The delete prompt counts objects, not plan entries.** `Plan.DeleteObjectCount()` walks every entry's `OpDelete` diffs; the plan summary counts entries by status. One resource node whose worst op is delete contributes 1 entry regardless of batch size, so reading the summary would undercount — in the worst case telling the operator "1 object" while two die. The prompt and the non-TTY refusal both use the object count.
+3. **The prompt only covers plan-visible deletes.** A chain that becomes destructive only after an upstream action runs (known-after-apply) can delete unprompted. Materialized flows — where `render` freezes every input before `plan` — give the prompt full coverage; that is the recommended shape for destructive changes.
+4. **Kind-removal leaves orphans.** Prune lists only kinds present in the desired set (label-scoped LIST per GVR). A Service whose kind vanishes entirely from the flow is never listed: no plan entry, no prompt, no deletion — it is orphaned, not silently destroyed. Phase 4's inventory closes this.
+5. **Three count bases, each labeled.** Plan text entry suffix `N changes` (diff count — honest for mixed create/delete batches), summary footer `N delete entry` (entry count; only the delete token carries the ` entry` suffix because it is the safety-relevant count — other tokens remain bare entry counts by design), prompt `N object(s)` (actual OpDelete objects). Three bases, three labels, no number reused for two meanings.
+6. **Header vs banner — both exist on purpose.** Text mode prints a header on stdout after planning (`driver: k8s context: … namespace: … force: … prune: …`); a one-line banner on stderr prints after config parsing but *before* connecting. The banner is the only context signal in `-o json` mode (the header is text-only; Plan JSON carries no target) and when discovery fails (the header never prints). Known limitation: the header's k8s form is verified by unit test (`TestPrintPlanHeader`) and live demo only — hermetic end-to-end verification needs a fake discovery path, deferred.
+7. **`render --check` is an exit-code contract.** Stale/edited/missing files → exit 1 with `render --check: N file(s) not up to date`; stdout keeps printing the would-be content (the `terraform fmt -check` style), so a CI log shows the diff that was refused.
+
+## 6. Open questions
 
 1. Name and schema group: the code uses `afon`, and it ends up in labels and API versions, so settle it before the first release.
 2. Hooks (migrations that must finish before a Deployment): excluded from v1, with `needs` as the likely mechanism.
 3. Release storage: in-cluster Secrets now. Revisit an external backend if cluster loss matters.
-4. Where the engine/driver boundary sits for readiness: the engine owns the gate policy, and the driver reports status.
+4. ~~Where the engine/driver boundary sits for readiness~~ — **resolved:** the engine owns the gate policy (`ExecutorOptions.Wait`), the driver reports status (`driver.Waiter`).

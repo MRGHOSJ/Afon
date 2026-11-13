@@ -7,8 +7,8 @@ Part-time pacing, about 12 weeks to a demoable project. Each phase ends with som
 ## Phase 0: Setup and design (week 1)
 
 - ✅ Repo, package layout, k3d dev cluster
-- 🔨 `docs/design.md`: action vs. resource, ClusterProfile, release record, flow schema
-- ⬜ CI running `go vet` and `go test ./...`
+- ✅ `docs/design.md`: action vs. resource, ClusterProfile, release record, flow schema
+- ✅ CI running `go vet` and `go test ./...`
 
 **Done when:** the design doc exists and you can explain what a plan means for each node kind.
 
@@ -38,14 +38,15 @@ Part-time pacing, about 12 weeks to a demoable project. Each phase ends with som
 
 ## Phase 3: Kubernetes driver (weeks 6-7)
 
-- ⬜ `k8s-manifests` renderer (plain YAML first, Kustomize after)
-- ⬜ Plan via server-side dry-run, apply via server-side apply with an Afon field manager
-- ⬜ Inventory-based pruning
-- ⬜ Readiness waiting
-- ⬜ Context and namespace shown in every plan, confirmation for non-local contexts
+- ✅ `k8s-manifests` renderer (plain YAML; Kustomize after)
+- ✅ Plan via server-side dry-run, apply via server-side apply with an Afon field manager
+- ✅ Pruning by owner labels (same-kind removal; UID inventory → Phase 4)
+- ✅ Readiness waiting (engine gate policy + `driver.Waiter`)
+- ✅ Context and namespace shown in every plan
+- ⬜ Confirmation for non-local contexts (the delete-confirmation prompt exists; a context warning does not)
 - ⬜ Profile feeds plan: first two checks ("route requested but no ingress class", "apply needs `patch` but access denied")
 
-**Done when:** you can deploy a sample app to k3d, rerun for a no-op plan, change it for a correct diff, and remove a manifest and watch it pruned safely.
+**Done when:** you can deploy a sample app to k3d, rerun for a no-op plan, change it for a correct diff, and remove a manifest and watch it pruned safely. **Met** for same-kind removal — removing a kind entirely from a flow leaves orphans until Phase 4's inventory (documented gap, design.md §5.4).
 
 ## Phase 4: Releases and rollback (week 8)
 
