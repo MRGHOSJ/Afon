@@ -18,7 +18,8 @@ type CompiledNode struct {
 	Needs []string
 	// Config is the marked config: strings replaced by Reference/Template.
 	Config any
-	// OnFailure is "halt" (default) or the rejected "rollback".
+	// OnFailure is "halt" (default) or "rollback" — rollback arms the
+	// automatic rollback of the previous release when this node fails.
 	OnFailure string
 	IDPos     schema.Position
 	Refs      []schema.Ref
@@ -83,12 +84,7 @@ func Compile(flow *schema.Flow, reg *Registry) (*CompiledFlow, error) {
 			onFailure = "halt"
 		}
 		switch onFailure {
-		case "halt":
-		case "rollback":
-			return nil, &ConfigError{
-				Pos:     src.IDPos,
-				Message: fmt.Sprintf("node %q: onFailure: rollback not implemented until Phase 4", src.ID),
-			}
+		case "halt", "rollback":
 		default:
 			return nil, &ConfigError{
 				Pos:     src.IDPos,

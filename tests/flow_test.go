@@ -174,23 +174,22 @@ func TestFlow_ApplyTwiceThenPlan(t *testing.T) {
 	}
 }
 
-// TestFlow_ValidateRejectsRollback: rollback fails at validate time, not
-// halfway through a run.
-func TestFlow_ValidateRejectsRollback(t *testing.T) {
+// TestFlow_AcceptsOnFailureRollback: onFailure: rollback is a valid
+// Phase 4 node key — validate, plan, and apply all accept it. The
+// automatic rollback only arms when the node actually fails; with the
+// fake driver it succeeds and nothing rolls back.
+func TestFlow_AcceptsOnFailureRollback(t *testing.T) {
 	path := writeFlow(t)
 	src := strings.Replace(e2eFlow, "type: image-ref", "type: image-ref\n      onFailure: rollback", 1)
-	broken := filepath.Join(filepath.Dir(path), "rollback.yaml")
-	if err := os.WriteFile(broken, []byte(src), 0o644); err != nil {
+	rb := filepath.Join(filepath.Dir(path), "rollback.yaml")
+	if err := os.WriteFile(rb, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for _, cmd := range []string{"validate", "plan", "apply"} {
-		r := runAf(t, nil, cmd, "-f", broken)
-		if r.code != 1 {
-			t.Errorf("%s exit = %d, want 1", cmd, r.code)
-		}
-		combined := r.stdout + r.stderr
-		if !strings.Contains(combined, "not implemented until Phase 4") {
-			t.Errorf("%s must reject rollback at validate time:\n%s", cmd, combined)
+		r := runAf(t, nil, cmd, "-f", rb)
+		if r.code != 0 {
+			t.Errorf("%s exit = %d, want 0\nstdout: %s\nstderr: %s",
+				cmd, r.code, r.stdout, r.stderr)
 		}
 	}
 }

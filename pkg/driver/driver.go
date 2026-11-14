@@ -86,6 +86,59 @@ type Waiter interface {
 	Wait(ctx context.Context, owner Owner, objs []Object, timeout time.Duration) error
 }
 
+// LiveObject is one live object as ObjectReader reported it: identity
+// plus the UID and content hash the release record captures for
+// status comparison.
+type LiveObject struct {
+	Object Object
+	// UID is the cluster's immutable identity for this object.
+	UID string
+	// ResourceVersion is the live object's version at read time.
+	ResourceVersion string
+	// Hash is the driver's canonical content hash of the live object:
+	// volatile keys (uid, resourceVersion, status, …) excluded, so the
+	// same content hashes equal across reads.
+	Hash string
+}
+
+// ObjectReader is an optional driver capability: read live state for
+// objects the driver manages. The engine type-asserts Driver to
+// ObjectReader after a successful apply to capture a release record's
+// inventory (design §3); drivers without it (fake) produce records
+// with empty inventory and a warning.
+//
+// Semantics: objects absent from live state are omitted from the
+// result — NotFound is data (the caller diffs what it asked for
+// against what came back), not an error. owner scopes the read to one
+// flow/node; implementations may ignore it or use it to skip objects
+// claimed by a different owner, but must never fail a read because of
+// it.
+type ObjectReader interface {
+	Read(ctx context.Context, owner Owner, objs []Object) ([]LiveObject, error)
+}
+
+// ObjectKind names one resource type without pinning a version: the
+// API picks the served version when listing.
+type ObjectKind struct {
+	Group string
+	Kind  string
+}
+
+// ObjectLister is an optional driver capability: list live objects a
+// flow owns, restricted to the given kinds. afon status uses it to
+// find extras — objects carrying the flow's labels that the latest
+// release record does not know about. A cluster may serve hundreds of
+// resource types, so callers pass only the kinds their records
+// mention; drivers skip kinds the API no longer serves (their objects
+// are gone with them) and surface any other failure.
+//
+// owner.Node scopes to one node when set; an empty Node lists every
+// node of the flow (status's case — an extra may belong to a node the
+// current flow no longer has).
+type ObjectLister interface {
+	ListOwned(ctx context.Context, owner Owner, kinds []ObjectKind) ([]Object, error)
+}
+
 // ErrForeignOwner reports a desired object whose live instance carries
 // ownership for a different flow or node. Plan refuses instead of
 // adopting or clobbering it (design §4). Flow and Node are the owners

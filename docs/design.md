@@ -33,7 +33,7 @@ key = sha256(canonicalJSON{ type, typeVersion, resolvedConfig })
 
 **Outputs feed resources.** `image-build` outputs a digest, and the manifests consume it. Deploys are by digest, never by tag, so a rollback restores exactly what ran before.
 
-**Execution:** nodes whose dependencies are complete run in parallel (`errgroup`). On a failure the executor stops scheduling, lets in-flight nodes finish or cancel, and records exactly what succeeded. No release is marked `deployed` unless the flow completed.
+**Execution:** nodes whose dependencies are complete run in parallel (`errgroup`). On a failure the executor stops scheduling, lets in-flight nodes finish or cancel, and records exactly what succeeded. No release is marked `succeeded` unless the flow completed.
 
 **Node interfaces (implemented in `pkg/engine`).** The kind belongs to the type, so the contract splits:
 
@@ -106,42 +106,45 @@ Conventions that every consumer relies on:
 - **`schedulingHeadroom` is allocatable minus pod requests.** It is not usage.
 - **Safe to save:** labels and annotations are allowlisted, `k3s.io/node-args` and `node-env` are never emitted, and `--redact` masks identifiers and addresses.
 
-## 3. Release record (`afon.dev/release/v1`)
+## 3. Release record (`afon.release/v1`)
 
-One immutable record per apply attempt, stored as a Secret in the target namespace (the approach Helm uses), compressed.
+One immutable record per apply attempt, stored as a Secret in the target namespace (the approach Helm uses).
 
 ```
 name:   afon.release.<flow>.v<N>
-labels: afon.dev/flow, afon.dev/revision, afon.dev/status
-data:   release = gzip(JSON(Release))
+labels: afon.dev/release-flow, afon.dev/release-seq
+data:   release = base64(JSON(Record))
 ```
 
 ```go
-type Release struct {
-    APIVersion   string         // afon.dev/release/v1
-    Flow         string
-    Revision     int            // monotonic, never reused
-    Status       string         // pending | deployed | failed | superseded | rolledback
-    CreatedAt    time.Time
-    FlowHash     string         // hash of the flow file as applied
-    RolledBackTo *int
-    Target       TargetRef      // context, namespace, cluster UID
-    Actions      []ActionRecord // nodeId, cache key, outputs (digests, SHAs), cached?
-    Manifests    []byte         // rendered YAML, secret data stripped
-    Inventory    []ObjectRef    // group, version, kind, namespace, name, UID
-    Profile      *ProfileDigest // small summary: flavor, version, detected components
+type Record struct {
+    APIVersion       string            // afon.release/v1
+    Flow             string
+    Sequence         int               // monotonic per flow, never reused
+    Status           Status            // pending | succeeded | failed | rolledback
+    Trigger          Trigger           // manual | rollback (auto is reserved, never emitted in v1)
+    PreviousSequence int               // the sequence before this one (omitempty)
+    RolledBackTo     int               // rollback target K; 0 on non-rollback records (omitempty)
+    StartedAt        time.Time
+    FinishedAt       time.Time         // zero while pending
+    Manifests        []ManifestStream  // per resource node: {node, yaml} exactly as applied
+    Inventory        []InventoryObject // {group, version, kind, namespace, name, node, uid, hash}
+    Error            string            // failure text on failed records (omitempty)
 }
 ```
 
 Rules:
 
-- **Append-only.** A rollback writes revision N+1 with `rolledBackTo: K`. Nothing is overwritten.
-- **`pending` is written before apply starts.** A `pending` record with no live run means a crashed run, which the next run detects and reports. A non-stale `pending` record also blocks concurrent applies.
-- **Inventory drives pruning.** Delete only objects in the previous inventory that are absent from the new one, matched by UID as well as name. Never delete anything outside the inventory, and never match by label alone.
+- **Append-only.** A rollback writes sequence N+1 with `rolledBackTo: K`. Nothing is overwritten.
+- **`pending` is written before apply starts.** A `pending` record with no live run means a crashed run, which the next run detects and reports (stale after 10 minutes: fresh pending blocks concurrent applies with a "wait" error, stale pending is a "probable crashed run" that `--takeover` supersedes). Superseding promotes the stale record to `failed` first.
+- **Inventory drives pruning.** Delete only recorded objects the flow no longer desires; every candidate is verified live (exists, owned by the same flow/node) before it is deleted, so label matching alone never removes a foreign object. Recorded objects of kinds no node desires are covered too — the kind-removal case label listing cannot see (design §5.4). `--no-prune` disables both halves.
+- **Failed runs still inventory what they applied.** The inventory claims live ownership: a record promoted after a wait failure still names the objects that reached the cluster, so a later rollback can prune them (without this, a broken rollout's Deployment would survive its own rollback). Manifest streams stay success-only — a failed release is never a rollback target (`Restorable`).
 - **Never stored:** secret values, kubeconfig contents, tokens, registry credentials, or the full profile.
-- **Limits:** a Secret holds at most 1 MiB, so payloads are gzipped, failures are loud, and old revisions are pruned (default keep 10). A later `Backend` implementation can store releases elsewhere.
+- **Limits:** a Secret holds at most 1 MiB, so the payload is small JSON (base64 in the Secret data), failures are loud, and old records are pruned (default keep 10). A later `Backend` implementation can store releases elsewhere.
 
-**Rollback** re-applies release K's manifests and digests (dry-run plan first), prunes by inventory, and writes a new revision. It does **not** undo database migrations, volume contents, CRD schema changes, or effects outside the cluster, and the rollback plan says so. Auto-rollback after a failed readiness gate uses the same path.
+**Reading records.** `afon history` lists them newest-first; `afon status` diffs the newest comparable record's inventory against live state (missing / recreated / changed / extra); all three record commands refuse a non-k8s driver with a fixed message instead of showing a misleading empty result.
+
+**Rollback** re-applies release K's recorded manifest streams (dry-run plan first, replayed as resource nodes under their recorded node ids), prunes by inventory, and writes a new revision. It does **not** undo database migrations, volume contents, CRD schema changes, or effects outside the cluster, and the rollback plan says so. Manual rollback prompts for deletes like apply; the automatic path (`onFailure: rollback`, below) skips the prompt and announces itself on stderr. Both use the same `Rollback` path.
 
 ## 4. Flow YAML schema (`afon.dev/flow/v1`)
 
@@ -170,7 +173,7 @@ spec:
       onFailure: rollback
 ```
 
-(Wait is not a per-node key: `k8s-apply` accepts only `manifests`. Readiness waiting is engine-level — `--wait-timeout` / `--no-wait`, see section 5. `onFailure: rollback` is Phase 4.)
+(Wait is not a per-node key: `k8s-apply` accepts only `manifests`. Readiness waiting is engine-level — `--wait-timeout` / `--no-wait`, see section 5. `onFailure: rollback` arms the automatic rollback of the previous release when this node fails — see section 3.)
 
 ```go
 type Node struct {
@@ -194,7 +197,7 @@ These decisions landed with the apply-safeguard stage; each exists to stop a spe
 1. **Readiness waiting is driver-reported, engine-gated.** The engine decides *whether* to wait (`ExecutorOptions.Wait` / `WaitTimeout`, fed by the `--wait-timeout` and `--no-wait` flags); the driver reports *when* objects are ready through the additive `driver.Waiter` interface. `timeout <= 0` means no deadline — the context bounds the wait (kubectl semantics). The engine waits only for objects its own create/update diffs produced, and a wait failure fails the node (`wait: …`) before any release could be marked deployed. Unknown kinds are skipped, an object that disappears during the wait is an error, and a `Failed` Job fails immediately with its condition message.
 2. **The delete prompt counts objects, not plan entries.** `Plan.DeleteObjectCount()` walks every entry's `OpDelete` diffs; the plan summary counts entries by status. One resource node whose worst op is delete contributes 1 entry regardless of batch size, so reading the summary would undercount — in the worst case telling the operator "1 object" while two die. The prompt and the non-TTY refusal both use the object count.
 3. **The prompt only covers plan-visible deletes.** A chain that becomes destructive only after an upstream action runs (known-after-apply) can delete unprompted. Materialized flows — where `render` freezes every input before `plan` — give the prompt full coverage; that is the recommended shape for destructive changes.
-4. **Kind-removal leaves orphans.** Prune lists only kinds present in the desired set (label-scoped LIST per GVR). A Service whose kind vanishes entirely from the flow is never listed: no plan entry, no prompt, no deletion — it is orphaned, not silently destroyed. Phase 4's inventory closes this.
+4. **Kind-removal orphans are pruned by inventory.** Label prune lists only kinds present in the desired set (label-scoped LIST per GVR): a Service whose kind vanishes entirely from the flow is never listed that way. The release record's inventory names every object the flow last owned, and plan plus apply delete recorded objects the flow no longer desires after verifying each is still live and owned — closing the gap the desired-set listing can never see. `--no-prune` disables both halves, and a record-read failure during apply degrades to a warning (prune is best-effort; apply never depends on record-keeping).
 5. **Three count bases, each labeled.** Plan text entry suffix `N changes` (diff count — honest for mixed create/delete batches), summary footer `N delete entry` (entry count; only the delete token carries the ` entry` suffix because it is the safety-relevant count — other tokens remain bare entry counts by design), prompt `N object(s)` (actual OpDelete objects). Three bases, three labels, no number reused for two meanings.
 6. **Header vs banner — both exist on purpose.** Text mode prints a header on stdout after planning (`driver: k8s context: … namespace: … force: … prune: …`); a one-line banner on stderr prints after config parsing but *before* connecting. The banner is the only context signal in `-o json` mode (the header is text-only; Plan JSON carries no target) and when discovery fails (the header never prints). Known limitation: the header's k8s form is verified by unit test (`TestPrintPlanHeader`) and live demo only — hermetic end-to-end verification needs a fake discovery path, deferred.
 7. **`render --check` is an exit-code contract.** Stale/edited/missing files → exit 1 with `render --check: N file(s) not up to date`; stdout keeps printing the would-be content (the `terraform fmt -check` style), so a CI log shows the diff that was refused.

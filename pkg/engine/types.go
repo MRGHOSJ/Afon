@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/MRGHOSJ/afon/pkg/driver"
 	"github.com/MRGHOSJ/afon/pkg/schema"
 )
 
@@ -94,14 +95,30 @@ type NodeResult struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-// RunResult is the outcome of one apply. All writes go through Record so
-// concurrent node completions are safe.
+// AppliedNode records what one resource node put into live state: the
+// desired objects (release inventory needs OpNone ones too) and the
+// node's YAML stream (rollback replays recorded manifests instead of
+// re-rendering the flow). Captured only for nodes that succeeded.
+type AppliedNode struct {
+	Owner     driver.Owner
+	Objects   []driver.Object
+	Manifests string
+}
+
+// RunResult is the outcome of one apply. All writes go through Record
+// so concurrent node completions are safe.
 type RunResult struct {
 	mu    sync.Mutex
 	Nodes map[string]NodeResult
 	// Failed is true when at least one node failed (as opposed to the run
 	// being cancelled by a signal).
 	Failed bool
+	// warnings are non-fatal run-level issues (release records, live
+	// state reads). Printed by the CLI after the per-node results.
+	warnings []string
+	// applied collects each resource node's applied objects and
+	// manifest stream for the release record.
+	applied []AppliedNode
 }
 
 func newRunResult() *RunResult {
@@ -119,6 +136,36 @@ func (r *RunResult) Record(res NodeResult) {
 		res.ErrText = res.Err.Error()
 	}
 	r.Nodes[res.NodeID] = res
+}
+
+// AddWarning records a non-fatal run-level issue. Safe for concurrent use.
+func (r *RunResult) AddWarning(msg string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.warnings = append(r.warnings, msg)
+}
+
+// Warnings returns the run's warnings in order. Safe for concurrent use.
+func (r *RunResult) Warnings() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.warnings...)
+}
+
+// recordApplied stores a resource node's applied objects and manifest
+// stream for the release record. Safe for concurrent use.
+func (r *RunResult) recordApplied(a AppliedNode) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.applied = append(r.applied, a)
+}
+
+// appliedSnapshot copies the run's applied nodes for safe iteration
+// after the run.
+func (r *RunResult) appliedSnapshot() []AppliedNode {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]AppliedNode(nil), r.applied...)
 }
 
 // Get returns a node's result.

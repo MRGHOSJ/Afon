@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/MRGHOSJ/afon/pkg/driver"
+	"github.com/MRGHOSJ/afon/pkg/release"
 )
 
 // Plan statuses.
@@ -58,12 +59,31 @@ type Plan struct {
 	ActionOutputs map[string]Outputs `json:"-"`
 }
 
+// PlanOptions tunes BuildPlanOpts.
+type PlanOptions struct {
+	// Backend enables inventory prune: the newest recorded release
+	// that carries inventory contributes delete diffs for objects the
+	// flow no longer desires — including kinds no node desires at
+	// all, which the driver's label listing can never see. Nil
+	// disables it (BuildPlan's behavior, and what the CLI passes
+	// with --no-prune).
+	Backend release.Backend
+}
+
 // BuildPlan walks the compiled flow in topological order and decides each
 // node's treatment. Actions are never run: a cache hit supplies real
 // outputs so downstream nodes plan normally; a miss marks outputs Unknown
 // so downstream entries degrade to will-run or known-after-apply
 // (design Unknown rules).
 func BuildPlan(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driver) (*Plan, error) {
+	return BuildPlanOpts(ctx, cf, store, d, PlanOptions{})
+}
+
+// BuildPlanOpts is BuildPlan with PlanOptions: with a Backend set,
+// every resource node's entry also carries inventory-prune deletes
+// (design §4), so plan, its delete-confirmation count, and apply agree
+// on what pruning will destroy.
+func BuildPlanOpts(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driver, opts PlanOptions) (*Plan, error) {
 	p := &Plan{
 		Flow:          cf.Name,
 		File:          cf.File,
@@ -104,7 +124,7 @@ func BuildPlan(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driv
 			}
 
 		case KindResource:
-			entry = planResource(ctx, cf, cn, resolved, d, upstream)
+			entry = planResource(ctx, cf, cn, resolved, d, upstream, opts)
 		default:
 			return nil, &ConfigError{Pos: cn.IDPos, Message: fmt.Sprintf("node %q: unknown kind %q", cn.ID, cn.NT.Kind())}
 		}
@@ -165,7 +185,7 @@ func planAction(cn *CompiledNode, resolved ResolveOutcome, store Store, in Input
 	return entry, declared(), nil
 }
 
-func planResource(ctx context.Context, cf *CompiledFlow, cn *CompiledNode, resolved ResolveOutcome, d driver.Driver, upstream map[string]Outputs) PlanEntry {
+func planResource(ctx context.Context, cf *CompiledFlow, cn *CompiledNode, resolved ResolveOutcome, d driver.Driver, upstream map[string]Outputs, opts PlanOptions) PlanEntry {
 	entry := PlanEntry{NodeID: cn.ID, Kind: KindResource}
 	if !resolved.Known {
 		entry.Status = PlanKnownAfterApply
@@ -191,6 +211,17 @@ func planResource(ctx context.Context, cf *CompiledFlow, cn *CompiledNode, resol
 		entry.Status = PlanKnownAfterApply
 		entry.Reason = fmt.Sprintf("driver plan failed: %v", err)
 		return entry
+	}
+	// Inventory prune: recorded objects this node no longer desires
+	// (kind-removal gap) join the label-prune deletes, deduped to one
+	// delete per object.
+	if opts.Backend != nil {
+		diffs, err = inventoryPruneDiffs(ctx, opts.Backend, d, owner, objs, diffs)
+		if err != nil {
+			entry.Status = PlanKnownAfterApply
+			entry.Reason = fmt.Sprintf("inventory prune: %v", err)
+			return entry
+		}
 	}
 	// Sort for deterministic output.
 	sort.Slice(diffs, func(i, j int) bool { return diffs[i].Object.Key() < diffs[j].Object.Key() })

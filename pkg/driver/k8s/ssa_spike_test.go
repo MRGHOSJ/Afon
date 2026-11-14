@@ -48,7 +48,8 @@ const (
 
 // spikeContextAllowed is the safety gate: a test that SSA-applies into a
 // cluster must never ride the ambient current context. Local sandboxes
-// only, unless AFON_SPIKE_ALLOW_CONTEXT names the context explicitly.
+// only (IsLocalSandbox), unless AFON_SPIKE_ALLOW_CONTEXT names the
+// context explicitly — the env escape hatch stays test-side.
 func spikeContextAllowed(name string) bool {
 	if name == "" {
 		return false
@@ -56,12 +57,7 @@ func spikeContextAllowed(name string) bool {
 	if env := os.Getenv("AFON_SPIKE_ALLOW_CONTEXT"); env != "" && env == name {
 		return true
 	}
-	for _, prefix := range []string{"k3d-", "kind-", "minikube", "rancher-desktop"} {
-		if strings.HasPrefix(name, prefix) {
-			return true
-		}
-	}
-	return false
+	return IsLocalSandbox(name)
 }
 
 // spikeDynamicClient gates the whole spike: log the context, allowlist
@@ -78,7 +74,7 @@ func spikeDynamicClient(t *testing.T) dynamic.Interface {
 	name := raw.CurrentContext
 	t.Logf("spike context: %q", name)
 	if !spikeContextAllowed(name) {
-		t.Skipf("context %q is not a local sandbox (allowlist: k3d-*, kind-*, minikube, rancher-desktop); set AFON_SPIKE_ALLOW_CONTEXT=%s to run here", name, name)
+		t.Skipf("context %q is not a local sandbox (allowlist: k3d-*, kind-*, minikube, rancher-desktop, docker-desktop); set AFON_SPIKE_ALLOW_CONTEXT=%s to run here", name, name)
 	}
 	restCfg, err := cc.ClientConfig()
 	if err != nil {

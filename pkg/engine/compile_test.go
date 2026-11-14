@@ -55,6 +55,35 @@ func TestCompile_Valid(t *testing.T) {
 	}
 }
 
+// TestCompileAcceptsOnFailureRollback: onFailure: rollback compiles
+// (Phase 4) and is stored per node alongside the halt default — the
+// apply path reads it to arm the automatic rollback.
+func TestCompileAcceptsOnFailureRollback(t *testing.T) {
+	const src = `apiVersion: afon.dev/flow/v1
+kind: Flow
+metadata: {name: t}
+spec:
+  nodes:
+    - id: a
+      type: image-ref
+      onFailure: rollback
+      config: {ref: r}
+    - id: b
+      type: image-ref
+      config: {ref: r2}
+`
+	cf, err := compile(t, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cf.byID["a"].OnFailure; got != "rollback" {
+		t.Errorf("a.OnFailure = %q, want rollback", got)
+	}
+	if got := cf.byID["b"].OnFailure; got != "halt" {
+		t.Errorf("b.OnFailure = %q, want halt", got)
+	}
+}
+
 func TestCompile_Errors(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -144,21 +173,6 @@ spec:
 `,
 			wantSub: "cycle:",
 			wantPos: "flow.yaml:1:1",
-		},
-		{
-			name: "rollback not implemented",
-			src: `apiVersion: afon.dev/flow/v1
-kind: Flow
-metadata: {name: t}
-spec:
-  nodes:
-    - id: a
-      type: image-ref
-      onFailure: rollback
-      config: {ref: r}
-`,
-			wantSub: "onFailure: rollback not implemented until Phase 4",
-			wantPos: "flow.yaml:6:11",
 		},
 		{
 			name: "reserved secret ref",

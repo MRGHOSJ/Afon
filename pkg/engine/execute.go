@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/MRGHOSJ/afon/pkg/driver"
+	"github.com/MRGHOSJ/afon/pkg/release"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -23,6 +25,26 @@ type ExecutorOptions struct {
 	// WaitTimeout bounds each wait (CLI --wait-timeout, default 5m);
 	// <= 0 means no deadline — the apply context bounds the wait.
 	WaitTimeout time.Duration
+	// Backend writes one release record per apply when non-nil (the
+	// k8s CLI wires the Secret backend; the fake driver passes nil and
+	// no records exist). A backend outage other than concurrency
+	// degrades to a warning — apply never depends on record-keeping.
+	Backend release.Backend
+	// Trigger labels the record: "" defaults to manual; rollback paths
+	// pass release.TriggerRollback.
+	Trigger release.Trigger
+	// Takeover lets the record's Start supersede a stale pending
+	// record (CLI --takeover). Fresh pending records still block.
+	Takeover bool
+	// Prune lets the run delete recorded objects this flow no longer
+	// desires (inventory prune; CLI --no-prune clears it). Separate
+	// from Backend because records are written even when pruning is
+	// off. A record-read failure during prune degrades to a warning:
+	// apply never depends on record-keeping.
+	Prune bool
+	// RolledBackTo names the release a rollback replayed (0 = not a
+	// rollback); it rides the record as the append-only audit trail.
+	RolledBackTo int
 }
 
 // runState is the shared mutable state of one Apply: the dependency
@@ -74,8 +96,13 @@ func (s *runState) complete(id string, r NodeResult) []string {
 //   - a cancelled node records cancelled, not failed;
 //   - when opts.Wait is set and the driver implements driver.Waiter,
 //     each resource node waits for the objects it created or updated
-//     before completing (rule: wait failures fail the node).
-func Apply(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driver, opts ExecutorOptions) (*RunResult, error) {
+//     before completing (rule: wait failures fail the node);
+//   - when opts.Backend is set, one release record per apply is
+//     reserved before any node runs (a concurrent apply is refused
+//     first, touching nothing) and promoted to succeeded/failed after
+//     the run — records are best-effort: their failures warn, never
+//     fail the apply.
+func Apply(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driver, opts ExecutorOptions) (res *RunResult, err error) {
 	if opts.Parallelism <= 0 {
 		opts.Parallelism = 4
 	}
@@ -85,6 +112,38 @@ func Apply(ctx context.Context, cf *CompiledFlow, store Store, d driver.Driver, 
 		dependents: map[string][]string{},
 		scheduled:  map[string]bool{},
 		res:        newRunResult(),
+	}
+
+	// Release record: reserve the sequence before scheduling so a
+	// concurrent apply is refused before any node runs. Only the
+	// concurrency refusal fails the apply; every other backend error
+	// degrades to a warning and the run proceeds without a record.
+	var pending *release.Record
+	if opts.Backend != nil {
+		trigger := opts.Trigger
+		if trigger == "" {
+			trigger = release.TriggerManual
+		}
+		started, startErr := opts.Backend.Start(ctx, release.Record{
+			APIVersion:   release.APIVersion,
+			Flow:         cf.Name,
+			Trigger:      trigger,
+			RolledBackTo: opts.RolledBackTo,
+		}, opts.Takeover)
+		var conc *release.ErrConcurrentApply
+		switch {
+		case startErr == nil:
+			pending = &started
+		case errors.As(startErr, &conc):
+			return st.res, startErr
+		default:
+			st.res.AddWarning(fmt.Sprintf("release record not started: %v", startErr))
+		}
+	}
+	if pending != nil {
+		defer func() {
+			finalizeRecord(st.res, opts, d, *pending, err)
+		}()
 	}
 
 	// Build the dependency countdown: a graph edge A→B means B depends on
@@ -293,6 +352,19 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 		if err != nil {
 			return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: err}
 		}
+		// Inventory prune: recorded objects this node no longer
+		// desires (kind-removal gap) join the label-prune deletes.
+		// A record-read failure degrades to a warning — plan already
+		// previews the deletes, and apply never depends on
+		// record-keeping (ExecutorOptions contract).
+		if opts.Backend != nil && opts.Prune {
+			merged, pErr := inventoryPruneDiffs(ctx, opts.Backend, d, owner, objs, diffs)
+			if pErr != nil {
+				res.AddWarning(fmt.Sprintf("inventory prune (node %s): %v", cn.ID, pErr))
+			} else {
+				diffs = merged
+			}
+		}
 		changed := make([]driver.Diff, 0, len(diffs))
 		for _, df := range diffs {
 			if df.Op != driver.OpNone {
@@ -306,6 +378,22 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 				}
 				return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: err}
 			}
+		}
+		// Capture what this node put into live state for the release
+		// record: every desired object (inventory needs OpNone ones
+		// too) plus the node's YAML stream. Recorded as soon as the
+		// apply succeeds — the objects are live regardless of a later
+		// wait failure, and a failed record must inventory them so a
+		// rollback can prune them (manifests stay success-only: a
+		// failed release is never restorable).
+		if manifests := resolvedManifests(resolved); len(objs) > 0 || manifests != "" {
+			res.recordApplied(AppliedNode{
+				Owner:     owner,
+				Objects:   objs,
+				Manifests: manifests,
+			})
+		}
+		if len(changed) > 0 {
 			// Wait only for objects that came to life or changed —
 			// deletes and none-diffs have nothing to become ready.
 			if opts.Wait {
@@ -375,4 +463,108 @@ func formatChanges(changed []driver.Diff) string {
 		parts = append(parts, fmt.Sprintf("+%d more", len(changed)-max))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// recordTimeout bounds record promotion. It runs detached from the
+// apply's context: a cancelled run must still record what happened.
+const recordTimeout = 15 * time.Second
+
+// finalizeRecord promotes the pending record to its terminal status.
+// Inventory claims ownership of what is actually live, so it is
+// captured for failed runs too — objects their apply put into the
+// cluster survive the failure and a later rollback must be able to
+// prune them. Manifests stay success-only: a failed release is never a
+// rollback target (release.Record.Restorable). A succeeded run captures
+// both through driver.ObjectReader. Promotion failures warn — the
+// record is bookkeeping, never a reason to fail an apply that already
+// finished.
+func finalizeRecord(res *RunResult, opts ExecutorOptions, d driver.Driver, pending release.Record, runErr error) {
+	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+	defer cancel()
+
+	final := pending
+	if runErr != nil {
+		final.Status = release.StatusFailed
+		final.Error = runErr.Error()
+	} else {
+		final.Status = release.StatusSucceeded
+		final.Manifests = manifestStreams(res)
+	}
+	final.Inventory = captureInventory(ctx, d, res)
+	if err := opts.Backend.Promote(ctx, final); err != nil {
+		res.AddWarning(fmt.Sprintf("release record: %v", err))
+	}
+}
+
+// manifestStreams renders each resource node's applied YAML stream in
+// node order — completion order is racy under parallelism, and the
+// record must be deterministic for tests and diffing.
+func manifestStreams(res *RunResult) []release.ManifestStream {
+	applied := res.appliedSnapshot()
+	out := make([]release.ManifestStream, 0, len(applied))
+	for _, a := range applied {
+		if a.Manifests != "" {
+			out = append(out, release.ManifestStream{Node: a.Owner.Node, YAML: a.Manifests})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Node < out[j].Node })
+	return out
+}
+
+// captureInventory reads live state for every object the run applied
+// and maps it into record inventory, attributed to the node that
+// applied it. A driver without ObjectReader (fake) warns and yields
+// empty inventory; a read failure keeps the nodes that succeeded —
+// partial inventory beats none, and a warning says so.
+func captureInventory(ctx context.Context, d driver.Driver, res *RunResult) []release.InventoryObject {
+	reader, ok := d.(driver.ObjectReader)
+	if !ok {
+		res.AddWarning("release record: driver does not report live state; inventory empty")
+		return nil
+	}
+	var out []release.InventoryObject
+	for _, a := range res.appliedSnapshot() {
+		if len(a.Objects) == 0 {
+			continue
+		}
+		lives, err := reader.Read(ctx, a.Owner, a.Objects)
+		if err != nil {
+			res.AddWarning(fmt.Sprintf("release record: reading live state for node %q: %v", a.Owner.Node, err))
+			continue
+		}
+		for _, l := range lives {
+			out = append(out, release.InventoryObject{
+				Group:     l.Object.Group,
+				Version:   l.Object.Version,
+				Kind:      l.Object.Kind,
+				Namespace: l.Object.Namespace,
+				Name:      l.Object.Name,
+				Node:      a.Owner.Node,
+				UID:       l.UID,
+				Hash:      l.Hash,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Node != b.Node {
+			return a.Node < b.Node
+		}
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		return a.Name < b.Name
+	})
+	return out
+}
+
+// resolvedManifests lifts the k8s-apply node's "manifests" stream out
+// of its resolved config; other resource types contribute none.
+func resolvedManifests(resolved ResolveOutcome) string {
+	m, ok := resolved.Value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	s, _ := m["manifests"].(string)
+	return s
 }

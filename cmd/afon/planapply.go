@@ -17,6 +17,7 @@ import (
 	"github.com/MRGHOSJ/afon/pkg/driver/fake"
 	"github.com/MRGHOSJ/afon/pkg/driver/k8s"
 	"github.com/MRGHOSJ/afon/pkg/engine"
+	"github.com/MRGHOSJ/afon/pkg/release"
 	"github.com/MRGHOSJ/afon/pkg/schema"
 	"github.com/spf13/cobra"
 )
@@ -31,6 +32,7 @@ var (
 	flagAutoApprove    bool
 	flagNoWait         bool
 	flagWaitTimeout    time.Duration
+	flagTakeover       bool
 )
 
 // stdinIsTerminal reports whether stdin is an interactive terminal.
@@ -89,6 +91,8 @@ func newApplyCmd() *cobra.Command {
 		"do not wait for created/updated objects to become ready")
 	cmd.Flags().DurationVar(&flagWaitTimeout, "wait-timeout", 5*time.Minute,
 		"how long to wait for created/updated objects to become ready (0 = wait indefinitely)")
+	cmd.Flags().BoolVar(&flagTakeover, "takeover", false,
+		"supersede a stale pending release record (probable crashed run); fresh pending records still block")
 	return cmd
 }
 
@@ -112,31 +116,51 @@ func addFlowFlags(cmd *cobra.Command) {
 // that --context and target.context agree on; it then banners which
 // cluster and namespace it is about to touch, after the kubeconfig
 // loads and before any connection is attempted. The returned context
-// name (empty for fake) feeds the plan header.
-func buildDriver(stateDir string, target schema.Target) (driver.Driver, string, error) {
+// name (empty for fake) feeds the plan header. The release backend
+// (k8s only; nil for fake) shares the driver's client and namespace,
+// scoped to flowName — plan prunes inventory through it, apply writes
+// records and prunes inventory through it.
+func buildDriver(stateDir string, target schema.Target, flowName string) (driver.Driver, string, release.Backend, error) {
 	switch flagDriver {
 	case "fake":
 		fmt.Fprintln(os.Stderr, "fake driver: no cluster is touched")
 		d, err := fake.NewPersistent(fakeStatePath(stateDir))
-		return d, "", err
+		return d, "", nil, err
 	case "k8s":
 		if target.Namespace == "" {
-			return nil, "", fmt.Errorf("the k8s driver needs spec.target.namespace in the flow")
+			return nil, "", nil, fmt.Errorf("the k8s driver needs spec.target.namespace in the flow")
 		}
 		ctxName, err := resolveContext(kubeContext, target.Context)
 		if err != nil {
-			return nil, "", err
+			return nil, "", nil, err
 		}
 		restCfg, err := clientConfigFor(ctxName).ClientConfig()
 		if err != nil {
-			return nil, "", kubeconfigError(err)
+			return nil, "", nil, kubeconfigError(err)
 		}
 		fmt.Fprintf(os.Stderr, "k8s driver: context=%s namespace=%s\n", ctxName, target.Namespace)
 		d, err := k8s.NewFromConfig(restCfg, target.Namespace, flagForceConflicts, !flagNoPrune)
-		return d, ctxName, err
+		if err != nil {
+			return nil, "", nil, err
+		}
+		backend, err := d.Backend(flowName)
+		if err != nil {
+			return nil, "", nil, err
+		}
+		return d, ctxName, backend, nil
 	default:
-		return nil, "", fmt.Errorf("unknown driver %q (available: fake, k8s)", flagDriver)
+		return nil, "", nil, fmt.Errorf("unknown driver %q (available: fake, k8s)", flagDriver)
 	}
+}
+
+// planPruneBackend returns the backend plan should prune inventory
+// with — nil when pruning is off (--no-prune), so the inventory half
+// of pruning agrees with the driver's label-prune half.
+func planPruneBackend(backend release.Backend) release.Backend {
+	if flagNoPrune {
+		return nil
+	}
+	return backend
 }
 
 // printPlanHeader writes the plan's one-line header to stdout before
@@ -184,11 +208,13 @@ func runPlan(ctx context.Context) error {
 	if err := warnStaleMaterialized(cf); err != nil {
 		return err
 	}
-	d, ctxName, err := buildDriver(stateDir, cf.Target)
+	d, ctxName, backend, err := buildDriver(stateDir, cf.Target, cf.Name)
 	if err != nil {
 		return err
 	}
-	p, err := engine.BuildPlan(ctx, cf, store, d)
+	p, err := engine.BuildPlanOpts(ctx, cf, store, d, engine.PlanOptions{
+		Backend: planPruneBackend(backend),
+	})
 	if err != nil {
 		return err
 	}
@@ -213,14 +239,16 @@ func runApply(ctx context.Context) error {
 	if err := warnStaleMaterialized(cf); err != nil {
 		return err
 	}
-	d, ctxName, err := buildDriver(stateDir, cf.Target)
+	d, ctxName, backend, err := buildDriver(stateDir, cf.Target, cf.Name)
 	if err != nil {
 		return err
 	}
 
 	// Apply re-plans internally against fresh state: no saved plans
 	// between plan and apply, so nothing goes stale.
-	p, err := engine.BuildPlan(ctx, cf, store, d)
+	p, err := engine.BuildPlanOpts(ctx, cf, store, d, engine.PlanOptions{
+		Backend: planPruneBackend(backend),
+	})
 	if err != nil {
 		return err
 	}
@@ -240,9 +268,71 @@ func runApply(ctx context.Context) error {
 		Parallelism: flagParallelism,
 		Wait:        !flagNoWait,
 		WaitTimeout: flagWaitTimeout,
+		Backend:     backend,
+		Takeover:    flagTakeover,
+		Prune:       !flagNoPrune,
 	})
 	// Results print even when Apply returns an error (e.g. a cancelled
 	// run): the per-node statuses are the point of the output.
+	printed := printRunOutcome(res, err)
+	// onFailure: rollback — after the failed apply's record is
+	// terminal (Apply's deferred promote has run) and its results are
+	// printed, replay the previous restorable release.
+	rbErr := maybeAutoRollback(ctx, cf, store, d, backend, res)
+	switch {
+	case printed != nil && rbErr != nil:
+		return fmt.Errorf("%w (auto-rollback failed: %v)", printed, rbErr)
+	case rbErr != nil:
+		return fmt.Errorf("auto-rollback: %w", rbErr)
+	}
+	return printed
+}
+
+// maybeAutoRollback runs the onFailure: rollback path after apply: a
+// failed node declaring it arms a replay of the previous restorable
+// release, announced on stderr. The automatic path deliberately skips
+// the delete-confirmation prompt (the run already failed — there is no
+// interactive plan to confirm) and prints its own results after the
+// apply's. Returns nil when no rollback is due.
+func maybeAutoRollback(ctx context.Context, cf *engine.CompiledFlow, store engine.Store, d driver.Driver, backend release.Backend, res *engine.RunResult) error {
+	target, err := engine.AutoRollbackTarget(ctx, cf, backend, res)
+	if err != nil {
+		return err
+	}
+	if target == 0 {
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "rolling back to release %d\n", target)
+	rbRes, rbErr := engine.Rollback(ctx, cf, store, d, target, engine.ExecutorOptions{
+		Parallelism: flagParallelism,
+		Wait:        !flagNoWait,
+		WaitTimeout: flagWaitTimeout,
+		Backend:     backend,
+		Takeover:    flagTakeover,
+		Prune:       !flagNoPrune,
+	})
+	if rbRes != nil {
+		if flagOutput == "json" {
+			// stdout stays the apply's single document; the rollback
+			// result goes to stderr as its own JSON blob.
+			if out, mErr := json.MarshalIndent(rbRes.Snapshot(), "", "  "); mErr == nil {
+				fmt.Fprintln(os.Stderr, string(out))
+			}
+		} else {
+			fmt.Print(renderRunResult(rbRes))
+		}
+		for _, w := range rbRes.Warnings() {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+		}
+	}
+	return rbErr
+}
+
+// printRunOutcome prints a run's per-node results (even when the run
+// errored — the statuses are the point) plus run-level warnings on
+// stderr so -o json stdout stays a single parseable document, then
+// returns the run error untouched. Shared by apply and rollback.
+func printRunOutcome(res *engine.RunResult, err error) error {
 	if flagOutput == "json" {
 		if res != nil {
 			out, mErr := json.MarshalIndent(res.Snapshot(), "", "  ")
@@ -252,6 +342,11 @@ func runApply(ctx context.Context) error {
 		}
 	} else if res != nil {
 		fmt.Print(renderRunResult(res))
+	}
+	if res != nil {
+		for _, w := range res.Warnings() {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+		}
 	}
 	return err
 }

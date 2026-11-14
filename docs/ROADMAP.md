@@ -40,23 +40,23 @@ Part-time pacing, about 12 weeks to a demoable project. Each phase ends with som
 
 - ✅ `k8s-manifests` renderer (plain YAML; Kustomize after)
 - ✅ Plan via server-side dry-run, apply via server-side apply with an Afon field manager
-- ✅ Pruning by owner labels (same-kind removal; UID inventory → Phase 4)
+- ✅ Pruning by owner labels (same-kind removal), plus inventory-driven prune (kind-removal, Phase 4)
 - ✅ Readiness waiting (engine gate policy + `driver.Waiter`)
 - ✅ Context and namespace shown in every plan
 - ⬜ Confirmation for non-local contexts (the delete-confirmation prompt exists; a context warning does not)
 - ⬜ Profile feeds plan: first two checks ("route requested but no ingress class", "apply needs `patch` but access denied")
 
-**Done when:** you can deploy a sample app to k3d, rerun for a no-op plan, change it for a correct diff, and remove a manifest and watch it pruned safely. **Met** for same-kind removal — removing a kind entirely from a flow leaves orphans until Phase 4's inventory (documented gap, design.md §5.4).
+**Done when:** you can deploy a sample app to k3d, rerun for a no-op plan, change it for a correct diff, and remove a manifest and watch it pruned safely. **Met** for same-kind removal — and the kind-removal orphan gap is closed by the release-record inventory (design.md §5.4).
 
 ## Phase 4: Releases and rollback (week 8)
 
-- ⬜ Release records as in-cluster Secrets, with a `Backend` interface
-- ⬜ `history`, `status`, `rollback --to`
-- ⬜ `pending` marker for crash detection and concurrency
-- ⬜ Auto-rollback when a readiness gate fails
-- ⬜ Rollback limits documented
+- ✅ Release records as in-cluster Secrets, with a `Backend` interface
+- ✅ `history`, `status`, `rollback --to`
+- ✅ `pending` marker for crash detection and concurrency
+- ✅ Auto-rollback (`onFailure: rollback`) after a failed node, including readiness-gate failures
+- ✅ Rollback limits documented (design.md §3)
 
-**Done when:** you can deploy v1, deploy a deliberately broken v2, watch it roll back automatically, and see both in `history`.
+**Done when:** you can deploy v1, deploy a deliberately broken v2, watch it roll back automatically, and see both in `history`. **Met** — live on k3d: v1 succeeded, v2 failed its readiness wait, the run printed `rolling back to release 1`, restored the ConfigMap, deleted the broken Deployment (failed records inventory what they applied), and `history` shows v1 succeeded / v2 failed / v3 rolledback.
 
 ## Phase 5: Pipeline nodes (weeks 9-10)
 

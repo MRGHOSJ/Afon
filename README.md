@@ -4,7 +4,7 @@
 
 Afon connects to an existing cluster, maps its active infrastructure, and runs an end-to-end delivery pipeline from git to a verified running deployment. Instead of rewriting or replacing your favorite infrastructure utilities, Afon provides a unified framework to drop in third-party tooling—such as security scanners, build engines, and GitOps agents—driven by a local CLI and visualized inside an interactive web control plane.
 
-> **Status: early, learning project.** `inspect`, the flow engine (`validate` / `render` / `plan` / `apply`), and the Kubernetes driver — server-side plan/apply, owner-scoped pruning, readiness waiting, delete confirmation — exist today. Release records, rollback, pipeline nodes, and the visual web control plane are still on the roadmap. See [Status](#status) for details.
+> **Status: early, learning project.** `inspect`, the flow engine (`validate` / `render` / `plan` / `apply`), the Kubernetes driver — server-side plan/apply, owner-scoped + inventory pruning, readiness waiting, delete confirmation — and release records with `history` / `status` / `rollback` exist today. Pipeline nodes and the visual web control plane are still on the roadmap. See [Status](#status) for details.
 
 ---
 
@@ -29,7 +29,7 @@ The project explores a highly distinct philosophy meant to combat DevOps toolcha
 | `flow.yaml` parser, validation layer & DAG engine | **Implemented** (no cluster: `validate`, `plan`, `apply` on a fake driver) |
 | Materialized manifest rendering (`afon render`, `--check`) | **Implemented** |
 | Kubernetes driver: SSA plan/apply, owner-scoped prune, readiness waiter, delete prompt, plan header | **Implemented** (k3d/kind/k3s) |
-| Release records, health-gated rollback (`history`/`status`/`rollback`) | Designed, not built |
+| Release records, health-gated rollback (`history`/`status`/`rollback`) | **Implemented** (k8s driver) |
 | Pipeline nodes (`git-source`, `image-build`, `trivy-scan`, Helm) | Planned |
 | Language-agnostic plugin & extension runtime | Planned |
 | Integrated Web UI & real-time topology map (`afon ui`) | Planned |
@@ -80,11 +80,27 @@ afon apply -f examples/hello-app/flow.yaml --driver k8s --context k3d-dev
 
 What to know before the first apply:
 
-- **Plan is read-only** — server-side dry-run classification plus a label-scoped LIST for pruning (owner labels `afon.dev/flow` / `afon.dev/node`; objects owned by another flow are refused, never adopted). Prune covers only kinds still present in the flow; a kind removed entirely is left orphaned (Phase 4 inventory closes that).
+- **Plan is read-only** — server-side dry-run classification plus a label-scoped LIST for pruning (owner labels `afon.dev/flow` / `afon.dev/node`; objects owned by another flow are refused, never adopted). The previous release's inventory covers the rest: objects the flow no longer owns — including a kind removed entirely from the flow — are deleted after a live read confirms them (disable both halves with `--no-prune`).
 - **Text mode prints a header** on stdout after planning: `driver: k8s context: … namespace: … force: off prune: on`. A one-line banner on stderr (`k8s driver: context=… namespace=…`) prints earlier, *before* connecting — it is the only context signal in `-o json` mode and when discovery fails, so both exist on purpose.
 - **Deletes ask first.** If the plan contains deletes, apply prompts `plan deletes N object(s); apply these changes? [y/N]` (N = actual objects, not plan entries). Non-interactive stdin (pipes, CI) refuses instead of guessing — pass `--auto-approve` to proceed.
 - **Apply waits for readiness** — Deployment/StatefulSet/DaemonSet rollouts, Job completion, Pod containers. Default timeout 5m (`--wait-timeout`); `0` means no deadline (the context bounds it); `--no-wait` skips.
 - **Namespace** comes from `spec.target.namespace` in the flow (required for the k8s driver); `--context` overrides `spec.target.context`.
+
+## What works today: release records and rollback
+
+Every apply writes an immutable release record (`afon.release.<flow>.v<N>`, a Secret in the target namespace, last 10 kept). Records need the k8s driver; other drivers refuse with `release records require the k8s driver (pass --driver k8s --context ...)`.
+
+```bash
+afon history -f flow.yaml --driver k8s --context k3d-dev   # newest-first: SEQ STATUS TRIGGER AGE OBJECTS
+afon status  -f flow.yaml --driver k8s --context k3d-dev   # latest release vs live: missing / recreated / changed / extra
+afon rollback -f flow.yaml --driver k8s --context k3d-dev  # prompt-confirm replays the previous release; --to K picks one
+```
+
+- **`status`** diffs the newest comparable record's inventory against live objects and stops with an info line when the latest run is still pending or failed.
+- **`rollback --to K`** dry-runs first, replays K's recorded manifest streams as resource nodes (prompt-confirm for deletes, like apply), and appends a new `rolledback` record — nothing is overwritten. `--to 0` (default) picks the newest restorable release before the latest.
+- **Automatic rollback:** a node with `onFailure: rollback` arms it — when any node fails (a readiness wait fails the node too), the previous release is restored automatically with a `rolling back to release K` notice on stderr, no prompt, and a `rolledback` record.
+- **Crash detection:** a fresh `pending` record blocks a concurrent apply (wait or `--takeover`); a stale one (>10 min) is reported as a probable crashed run and superseded by `--takeover`.
+- **Limits:** rollback restores recorded manifests only — not database migrations, volume contents, CRD schema changes, or anything outside the cluster (design.md §3).
 
 ### What the profile contains
 
@@ -165,7 +181,7 @@ spec:
       config:
         manifests: ${manifests.rendered}
         wait: { timeout: 120s }
-      onFailure: rollback     # automated status inversion hook
+      onFailure: rollback     # restore the previous release if this node fails
 ```
 
 ### Pluggable Extension Design
