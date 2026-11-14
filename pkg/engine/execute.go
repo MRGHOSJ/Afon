@@ -45,6 +45,10 @@ type ExecutorOptions struct {
 	// RolledBackTo names the release a rollback replayed (0 = not a
 	// rollback); it rides the record as the append-only audit trail.
 	RolledBackTo int
+	// Cluster is the optional cluster runner handed to ClusterAware
+	// action nodes on a cache miss (nil for plan-side machinery, the
+	// fake driver, and tests without a cluster; see ClusterAware).
+	Cluster any
 }
 
 // runState is the shared mutable state of one Apply: the dependency
@@ -329,12 +333,20 @@ func runNode(ctx context.Context, cf *CompiledFlow, id string, res *RunResult, s
 		if outs, ok, err := store.Get(key); err == nil && ok && store.Verify(key, outs) {
 			return NodeResult{NodeID: cn.ID, Status: StatusSucceeded, Cached: true, Outputs: outs}
 		}
-		outs, err := nt.Run(ctx, resolved.Value, in)
-		if err != nil {
+		// ClusterAware nodes get their cluster when one was attached;
+		// otherwise Run's no-cluster path answers (clear error).
+		var outs Outputs
+		var runErr error
+		if ca, isCluster := nt.(ClusterAware); isCluster && opts.Cluster != nil {
+			outs, runErr = ca.RunCluster(ctx, resolved.Value, in, opts.Cluster)
+		} else {
+			outs, runErr = nt.Run(ctx, resolved.Value, in)
+		}
+		if runErr != nil {
 			if ctx.Err() != nil {
 				return NodeResult{NodeID: cn.ID, Status: StatusCancelled, Err: ctx.Err()}
 			}
-			return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: err}
+			return NodeResult{NodeID: cn.ID, Status: StatusFailed, Err: runErr}
 		}
 		// Rule 4: only a successful Run writes the cache.
 		if err := store.Put(key, outs); err != nil {

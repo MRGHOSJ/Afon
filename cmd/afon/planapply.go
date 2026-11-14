@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MRGHOSJ/afon/pkg/build"
 	"github.com/MRGHOSJ/afon/pkg/driver"
 	"github.com/MRGHOSJ/afon/pkg/driver/fake"
 	"github.com/MRGHOSJ/afon/pkg/driver/k8s"
@@ -20,6 +21,7 @@ import (
 	"github.com/MRGHOSJ/afon/pkg/release"
 	"github.com/MRGHOSJ/afon/pkg/schema"
 	"github.com/spf13/cobra"
+	"k8s.io/client-go/kubernetes"
 )
 
 var (
@@ -119,38 +121,57 @@ func addFlowFlags(cmd *cobra.Command) {
 // name (empty for fake) feeds the plan header. The release backend
 // (k8s only; nil for fake) shares the driver's client and namespace,
 // scoped to flowName — plan prunes inventory through it, apply writes
-// records and prunes inventory through it.
-func buildDriver(stateDir string, target schema.Target, flowName string) (driver.Driver, string, release.Backend, error) {
+// records and prunes inventory through it. The returned build runner
+// (k8s only; nil for fake) is what apply attaches as the cluster for
+// image-build Nodes — one kubeconfig load feeds both clients.
+func buildDriver(stateDir string, target schema.Target, flowName string) (driver.Driver, *build.Runner, string, release.Backend, error) {
 	switch flagDriver {
 	case "fake":
 		fmt.Fprintln(os.Stderr, "fake driver: no cluster is touched")
 		d, err := fake.NewPersistent(fakeStatePath(stateDir))
-		return d, "", nil, err
+		return d, nil, "", nil, err
 	case "k8s":
 		if target.Namespace == "" {
-			return nil, "", nil, fmt.Errorf("the k8s driver needs spec.target.namespace in the flow")
+			return nil, nil, "", nil, fmt.Errorf("the k8s driver needs spec.target.namespace in the flow")
 		}
 		ctxName, err := resolveContext(kubeContext, target.Context)
 		if err != nil {
-			return nil, "", nil, err
+			return nil, nil, "", nil, err
 		}
 		restCfg, err := clientConfigFor(ctxName).ClientConfig()
 		if err != nil {
-			return nil, "", nil, kubeconfigError(err)
+			return nil, nil, "", nil, kubeconfigError(err)
 		}
 		fmt.Fprintf(os.Stderr, "k8s driver: context=%s namespace=%s\n", ctxName, target.Namespace)
 		d, err := k8s.NewFromConfig(restCfg, target.Namespace, flagForceConflicts, !flagNoPrune)
 		if err != nil {
-			return nil, "", nil, err
+			return nil, nil, "", nil, err
+		}
+		cs, err := kubernetes.NewForConfig(restCfg)
+		if err != nil {
+			return nil, nil, "", nil, err
 		}
 		backend, err := d.Backend(flowName)
 		if err != nil {
-			return nil, "", nil, err
+			return nil, nil, "", nil, err
 		}
-		return d, ctxName, backend, nil
+		return d, build.NewRunner(cs), ctxName, backend, nil
 	default:
-		return nil, "", nil, fmt.Errorf("unknown driver %q (available: fake, k8s)", flagDriver)
+		return nil, nil, "", nil, fmt.Errorf("unknown driver %q (available: fake, k8s)", flagDriver)
 	}
+}
+
+// clusterValue adapts the driver's runner to ExecutorOptions.Cluster.
+// The fake driver's nil runner must arrive as an UNtyped nil: a typed
+// nil in the interface counts as non-nil and would route image-build
+// into RunCluster (and only then trip the runner-is-nil guard), while
+// the untyped nil keeps dispatch on Run's clear "requires the k8s
+// driver (apply only)" refusal.
+func clusterValue(r *build.Runner) any {
+	if r == nil {
+		return nil
+	}
+	return r
 }
 
 // planPruneBackend returns the backend plan should prune inventory
@@ -208,7 +229,7 @@ func runPlan(ctx context.Context) error {
 	if err := warnStaleMaterialized(cf); err != nil {
 		return err
 	}
-	d, ctxName, backend, err := buildDriver(stateDir, cf.Target, cf.Name)
+	d, _, ctxName, backend, err := buildDriver(stateDir, cf.Target, cf.Name)
 	if err != nil {
 		return err
 	}
@@ -239,7 +260,7 @@ func runApply(ctx context.Context) error {
 	if err := warnStaleMaterialized(cf); err != nil {
 		return err
 	}
-	d, ctxName, backend, err := buildDriver(stateDir, cf.Target, cf.Name)
+	d, runner, ctxName, backend, err := buildDriver(stateDir, cf.Target, cf.Name)
 	if err != nil {
 		return err
 	}
@@ -271,6 +292,10 @@ func runApply(ctx context.Context) error {
 		Backend:     backend,
 		Takeover:    flagTakeover,
 		Prune:       !flagNoPrune,
+		// The only Cluster wiring site: image-build builds in the
+		// cluster on a cache miss; rollback flows are synthetic
+		// resource-only replays and deliberately get no cluster.
+		Cluster: clusterValue(runner),
 	})
 	// Results print even when Apply returns an error (e.g. a cancelled
 	// run): the per-node statuses are the point of the output.

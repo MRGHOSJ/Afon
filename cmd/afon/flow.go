@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/MRGHOSJ/afon/pkg/build"
 	"github.com/MRGHOSJ/afon/pkg/engine"
 	"github.com/MRGHOSJ/afon/pkg/schema"
 )
@@ -42,6 +43,10 @@ func newRegistry(extra ...engine.NodeType) (*engine.Registry, error) {
 		engine.K8sManifests{},
 		engine.AppManifests{},
 		engine.K8sApply{},
+		// Stage 7 action nodes: source and build (ClusterAware — the
+		// apply path attaches *build.Runner only with --driver k8s).
+		build.GitSource{},
+		build.ImageBuild{},
 	}, extra...) {
 		if err := reg.Register(nt); err != nil {
 			return nil, err

@@ -51,6 +51,23 @@ type InputCacher interface {
 	CacheInputs(cfg any, in Inputs) (extra string, err error)
 }
 
+// ClusterAware is the optional ActionType extension for action nodes
+// that need a Kubernetes cluster to Run — image-build executes a
+// throwaway Job. Such nodes still implement ActionType: Run stays the
+// no-cluster entry point and must fail with a clear "requires the k8s
+// driver (apply only)" error, because plan, validate, and render never
+// carry a cluster. When ExecutorOptions.Cluster is non-nil (apply
+// against a k8s driver), the executor calls RunCluster instead of Run
+// on a cache miss; a verified cache hit never touches the cluster.
+// cluster is whatever runner the CLI attached (pkg/build defines it):
+// the node type-asserts it and must fail clearly — never panic — when
+// the payload is not the type it expects. The engine never imports
+// Kubernetes types, so the payload stays `any` at this layer.
+type ClusterAware interface {
+	ActionType
+	RunCluster(ctx context.Context, cfg any, in Inputs, cluster any) (Outputs, error)
+}
+
 // MaterializedNode is an action node whose output can live in a file
 // that plan and apply read instead of re-running the node. The engine
 // passes the node's marked config (out is required to be a literal, so

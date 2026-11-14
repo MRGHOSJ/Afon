@@ -46,7 +46,7 @@ func runStatus(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	d, _, backend, err := buildDriver("", cf.Target, cf.Name)
+	d, _, _, backend, err := buildDriver("", cf.Target, cf.Name)
 	if err != nil {
 		return err
 	}

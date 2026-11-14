@@ -58,7 +58,7 @@ func runHistory(ctx context.Context) error {
 	}
 	// stateDir is irrelevant here: only the k8s path runs, and it
 	// never touches the cache.
-	_, _, backend, err := buildDriver("", cf.Target, cf.Name)
+	_, _, _, backend, err := buildDriver("", cf.Target, cf.Name)
 	if err != nil {
 		return err
 	}

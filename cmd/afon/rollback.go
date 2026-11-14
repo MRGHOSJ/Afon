@@ -68,7 +68,7 @@ func runRollback(ctx context.Context) error {
 	if err := warnStaleMaterialized(cf); err != nil {
 		return err
 	}
-	d, ctxName, backend, err := buildDriver(stateDir, cf.Target, cf.Name)
+	d, _, ctxName, backend, err := buildDriver(stateDir, cf.Target, cf.Name)
 	if err != nil {
 		return err
 	}
