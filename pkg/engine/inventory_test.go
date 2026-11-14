@@ -78,6 +78,14 @@ func TestBuildPlanOptsInventoryPrune(t *testing.T) {
 	if len(r2.Diffs) != 2 || r2.Diffs[1].Object.Name != "gone2" || r2.Diffs[1].Op != driver.OpDelete {
 		t.Errorf("r2 diffs = %+v", r2.Diffs)
 	}
+	// The demo's plan shape end to end: [none, delete] renders as one
+	// change — pins how the inventory merge builds Diffs against the
+	// suffix count (absence check: "1 change" is a substring of
+	// "1 changes").
+	if out := p.RenderText(); !strings.Contains(out, "1 change") ||
+		strings.Contains(out, "1 changes") {
+		t.Errorf("render must read \"1 change\":\n%s", out)
+	}
 	// BuildPlan (no opts) delegates with a zero PlanOptions: the
 	// recorded objects never surface and the reader is never touched.
 	rd.reads = 0

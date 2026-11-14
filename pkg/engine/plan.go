@@ -300,7 +300,21 @@ func (p *Plan) RenderText() string {
 			if e.Diff != nil {
 				line += fmt.Sprintf("  %s %s", e.Diff.Object.Kind, e.Diff.Object.Name)
 			} else if len(e.Diffs) > 0 {
-				line += fmt.Sprintf("  %d changes", len(e.Diffs))
+				// Count changes, not batch members: an OpNone diff is
+				// a checked-and-unchanged object, not a change — a
+				// [none, delete] batch is one change, not two.
+				n := 0
+				for _, df := range e.Diffs {
+					if df.Op != driver.OpNone {
+						n++
+					}
+				}
+				switch {
+				case n == 1:
+					line += "  1 change"
+				case n > 1:
+					line += fmt.Sprintf("  %d changes", n)
+				}
 			}
 		}
 		if e.Reason != "" {
