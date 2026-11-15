@@ -28,10 +28,10 @@ const (
 	// fires when afon itself is gone.
 	JobDeadlineSlackSeconds int64 = 60
 	// Container names inside the build pod: the git checkout runs as
-	// an init container; BuildKit runs as the main container and
-	// writes the digest to its termination message.
+	// an init container; kaniko runs as the main container and writes
+	// the digest to its termination message.
 	GitInitContainerName = "git-checkout"
-	BuildContainerName   = "buildkit"
+	BuildContainerName   = "kaniko"
 )
 
 // JobParams is what the primitive needs to build the throwaway build

@@ -30,7 +30,7 @@ The project explores a highly distinct philosophy meant to combat DevOps toolcha
 | Materialized manifest rendering (`afon render`, `--check`) | **Implemented** |
 | Kubernetes driver: SSA plan/apply, owner-scoped prune, readiness waiter, delete prompt, plan header | **Implemented** (k3d/kind/k3s) |
 | Release records, health-gated rollback (`history`/`status`/`rollback`) | **Implemented** (k8s driver) |
-| Pipeline nodes (`git-source`, `image-build`, `trivy-scan`, Helm) | Planned |
+| Pipeline nodes (`git-source`, `image-build` landed — kaniko Jobs under PSA baseline; `trivy-scan`, Helm planned) | **Partial** |
 | Language-agnostic plugin & extension runtime | Planned |
 | Integrated Web UI & real-time topology map (`afon ui`) | Planned |
 | Multi-cluster aggregated control plane agent | Planned |

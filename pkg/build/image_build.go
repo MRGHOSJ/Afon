@@ -3,7 +3,6 @@ package build
 import (
 	"context"
 	"fmt"
-	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -14,47 +13,51 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-// Pinned images (Stage 7 locks exact tags; see the 7f VERIFY report
-// for the flags/paths proven against them).
+// Pinned images (Stage 7 locks exact tags + digests; see the 7f
+// VERIFY report for the flags/paths proven against them).
 const (
-	// buildkitImage is the rootless BuildKit daemonless runner —
-	// verified v0.35.0: buildctl-daemonless.sh, busybox sh/sed/grep,
-	// metadata file key containerimage.digest (pretty-printed JSON).
-	buildkitImage = "moby/buildkit:v0.35.0-rootless"
+	// kanikoImage is the daemonless builder — verified v1.29.0
+	// (osscontainertools fork): entrypoint /kaniko/executor, flags
+	// --context/--context-sub-path/--dockerfile/--destination/
+	// --digest-file/--custom-platform/--build-arg/--target all present
+	// in --help, digest written to --digest-file even under --no-push.
+	// Full image, not slim: slim drops GCR/ECR/ACR auth and the
+	// cloud/git build contexts.
+	kanikoImage = "ghcr.io/osscontainertools/kaniko:v1.29.0@sha256:0c0b6c02991bba44090fad918ae177d193e1bd3fd0ccc643e7cc1f9f1a5a373d"
 	// gitInitImage is the init-container checkout tool — verified
 	// v2.54.0: git + sh present, image USER is root (the pod pins
 	// runAsUser 1000 explicitly).
 	gitInitImage = "alpine/git:v2.54.0"
 )
 
-// buildPodSeccomp is the evidence-driven Pod Security point (k3d-dev,
-// k3s v1.35.5+k3s1, live evidence rounds 2026-11-14): RuntimeDefault
-// blocks rootlesskit's own re-exec
-// ("rootlesskit: fork/exec /proc/self/exe: operation not permitted"),
-// so the pod must run seccomp Unconfined — which the PSA restricted
-// level forbids, so the build namespace (default afon-build) must
-// carry pod-security.kubernetes.io/enforce: privileged labels. Afon
-// never edits namespace labels; the required labels are documented in
-// design.md and echoed by the admission-refusal hint on the Job.
-const buildPodSeccomp = corev1.SeccompProfileTypeUnconfined
+// buildPodSeccomp: RuntimeDefault. Kaniko needs no rootlesskit
+// re-exec — the Unconfined requirement was BuildKit-specific (evidence
+// rounds 1→7 on k3d-dev, 2026-11-14, recorded in design.md as the
+// pivot justification). RuntimeDefault is accepted by PSA baseline, so
+// the build namespace (default afon-build) carries baseline labels,
+// not privileged. Afon never edits namespace labels; the required
+// labels are documented in design.md and echoed by the
+// admission-refusal hint on the Job.
+const buildPodSeccomp = corev1.SeccompProfileTypeRuntimeDefault
 
 const (
-	workspaceVolume   = "workspace"
-	dockerCfgVolume   = "docker-config"
-	gitAuthVolume     = "git-auth"
-	dockerCfgMount    = "/auth"
-	gitAuthMount      = "/afon/git-auth"
-	workspaceMount    = "/workspace"
-	terminationLog    = "/dev/termination-log"
-	metadataFilePath  = "/tmp/afon-metadata.json"
-	buildUser         = int64(1000)
-	defaultTimeout    = 20 * time.Minute
-	defaultNamespace  = "afon-build"
-	dockerConfigValue = dockerCfgMount // DOCKER_CONFIG env: buildctl reads $DOCKER_CONFIG/config.json
+	workspaceVolume = "workspace"
+	dockerCfgVolume = "docker-config"
+	gitAuthVolume   = "git-auth"
+	// dockerCfgMount is the image's own DOCKER_CONFIG directory
+	// (the kaniko image sets DOCKER_CONFIG=/kaniko/.docker/); the
+	// registry Secret's .dockerconfigjson lands there as config.json.
+	dockerCfgMount   = "/kaniko/.docker"
+	gitAuthMount     = "/afon/git-auth"
+	workspaceMount   = "/workspace"
+	terminationLog   = "/dev/termination-log"
+	buildUser        = int64(1000)
+	defaultTimeout   = 20 * time.Minute
+	defaultNamespace = "afon-build"
 )
 
-// ImageBuild runs a rootless BuildKit build inside a throwaway Job
-// and publishes the pushed image digest. Config is {image, repo, sha,
+// ImageBuild runs a kaniko build inside a throwaway Job and
+// publishes the pushed image digest. Config is {image, repo, sha,
 // dockerfile?, context?, target?, args?, platform?, namespace?,
 // registrySecret, gitSecret?, resources?, timeout?} — image carries no
 // tag (the tag is always the resolved git sha; :latest is impossible
@@ -545,7 +548,7 @@ git checkout -q -f %s
 			RunAsGroup:   ptr(buildUser),
 			RunAsNonRoot: ptr(true),
 			// git writes the checkout as 1000:1000; fsGroup keeps the
-			// shared workspace group-consistent for BuildKit.
+			// shared workspace group-consistent.
 			AllowPrivilegeEscalation: ptr(false),
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 		},
@@ -558,25 +561,28 @@ git checkout -q -f %s
 	return c
 }
 
-// buildContainer runs the daemonless BuildKit build and writes ONLY
-// the pushed digest line to the termination log (the metadata JSON
-// can exceed the 4096-byte message cap; verified key is
-// "containerimage.digest" with pretty-printed spacing). On buildctl
-// failure `set -e` stops before sed, leaving the log empty so
+// buildContainer runs the kaniko build via the image entrypoint
+// (/kaniko/executor — Command stays nil) with flags as argv elements:
+// no shell, so flow.yaml values cannot inject into a script (shQuote
+// remains only for the git-init script). The digest lands directly in
+// the termination log via --digest-file (verified v1.29.0 writes
+// sha256:<hex> there even under --no-push; on a real push it is the
+// pushed digest). On build failure the log stays empty so
 // terminationMessagePolicy=FallbackToLogsOnError surfaces the last
 // log chunk as the container message.
 func buildContainer(s *imageBuildSpec) corev1.Container {
-	ctxDir := path.Join(workspaceMount, s.Context)
-	var b strings.Builder
-	b.WriteString("set -eu\nbuildctl-daemonless.sh build --frontend dockerfile.v0")
-	fmt.Fprintf(&b, " --local %s --local %s",
-		shQuote("context="+ctxDir), shQuote("dockerfile="+ctxDir))
-	fmt.Fprintf(&b, " --opt %s", shQuote("filename="+s.Dockerfile))
+	args := []string{
+		"--context=dir://" + workspaceMount,
+	}
+	if s.Context != "." {
+		args = append(args, "--context-sub-path="+s.Context)
+	}
+	args = append(args, "--dockerfile="+s.Dockerfile)
 	if s.Target != "" {
-		fmt.Fprintf(&b, " --opt %s", shQuote("target="+s.Target))
+		args = append(args, "--target="+s.Target)
 	}
 	if s.Platform != "" {
-		fmt.Fprintf(&b, " --opt %s", shQuote("platform="+s.Platform))
+		args = append(args, "--custom-platform="+s.Platform)
 	}
 	keys := make([]string, 0, len(s.Args))
 	for k := range s.Args {
@@ -584,44 +590,42 @@ func buildContainer(s *imageBuildSpec) corev1.Container {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		fmt.Fprintf(&b, " --opt %s", shQuote("build-arg:"+k+"="+s.Args[k]))
+		args = append(args, "--build-arg="+k+"="+s.Args[k])
 	}
-	fmt.Fprintf(&b, " --output %s --metadata-file %s\n",
-		shQuote("type=image,name="+s.Image+":"+s.SHA+",push=true"), metadataFilePath)
-	fmt.Fprintf(&b, "sed -n %s %s > %s",
-		shQuote(`s/.*"containerimage\.digest": *"\([^"]*\)".*/\1/p`), metadataFilePath, terminationLog)
+	args = append(args,
+		"--destination="+s.Image+":"+s.SHA,
+		"--digest-file="+terminationLog,
+	)
 
 	return corev1.Container{
 		Name:            BuildContainerName,
-		Image:           buildkitImage,
-		Command:         []string{"sh", "-c"},
-		Args:            []string{b.String()},
+		Image:           kanikoImage,
+		Args:            args,
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Env: []corev1.EnvVar{
-			{Name: "DOCKER_CONFIG", Value: dockerConfigValue},
-		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: workspaceVolume, MountPath: workspaceMount},
 			{Name: dockerCfgVolume, MountPath: dockerCfgMount, ReadOnly: true},
 		},
 		Resources: s.Resources,
-		// Digest on success (written above); on failure the empty log
-		// falls back to the tail of buildctl's output for the error.
+		// Digest on success (written by --digest-file); on failure
+		// the empty log falls back to the tail of kaniko's output.
 		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 		SecurityContext: &corev1.SecurityContext{
-			RunAsNonRoot: ptr(true),
-			// Evidence (rounds b1→b3 on k3d-dev): newuidmap ships a
-			// security.capability xattr; with drop:ALL and an EMPTY
-			// bounding set its exec is denied EPERM even at
-			// NoNewPrivs=0, which wedges rootlesskit's uid/gid map
-			// setup. Keeping SETUID+SETGID in the bounding set (and
-			// allowing their elevation) makes the full rootless build
-			// succeed. Requires the privileged-level build namespace
-			// (PSA restricted/baseline forbid added caps and AE=true).
-			AllowPrivilegeEscalation: ptr(true),
+			// Kaniko unpacks the base image into its own rootfs and
+			// runs as root inside an ordinary container (verified
+			// baseline-PSA round 2026-11-15: admitted + built clean
+			// with this exact posture). No user namespace, no
+			// rootlesskit, no privilege escalation needed — CAP_CHOWN
+			// is the only added capability (kaniko chowns unpacked
+			// files); everything else dropped. readOnlyRootFilesystem
+			// is deliberately unset: the unpack writes the container
+			// rootfs (documented baseline relaxation in design.md).
+			RunAsUser:                ptr(int64(0)),
+			RunAsNonRoot:             ptr(false),
+			AllowPrivilegeEscalation: ptr(false),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
-				Add:  []corev1.Capability{"SETUID", "SETGID"},
+				Add:  []corev1.Capability{"CHOWN"},
 			},
 		},
 	}
@@ -630,9 +634,10 @@ func buildContainer(s *imageBuildSpec) corev1.Container {
 // buildVolumes: the shared checkout (emptyDir), the registry
 // credential (explicit items projection — key .dockerconfigjson, the
 // key kubectl create secret docker-registry writes, presented as
-// config.json under DOCKER_CONFIG), and optionally the git credential
-// (key credential, init container only). A wrong-shaped Secret fails
-// at mount time with a FailedMount event — Afon never reads Secrets.
+// config.json in the image's DOCKER_CONFIG dir /kaniko/.docker), and
+// optionally the git credential (key credential, init container only).
+// A wrong-shaped Secret fails at mount time with a FailedMount event —
+// Afon never reads Secrets.
 func buildVolumes(s *imageBuildSpec) []corev1.Volume {
 	mode := int32(0644)
 	vols := []corev1.Volume{
@@ -664,9 +669,9 @@ func buildVolumes(s *imageBuildSpec) []corev1.Volume {
 }
 
 // buildPodSecurityContext is the pod-level posture: fsGroup 1000 so
-// the shared workspace and mounts are group-consistent, and the
-// evidence-driven seccomp choice (Unconfined — RuntimeDefault blocks
-// rootlesskit; see buildPodSeccomp).
+// the shared workspace and mounts are group-consistent for the git
+// init container, and the seccomp choice (RuntimeDefault — see
+// buildPodSeccomp).
 func buildPodSecurityContext() *corev1.PodSecurityContext {
 	return &corev1.PodSecurityContext{
 		FSGroup: ptr(buildUser),

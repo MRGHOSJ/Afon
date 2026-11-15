@@ -60,8 +60,8 @@ Part-time pacing, about 12 weeks to a demoable project. Each phase ends with som
 
 ## Phase 5: Pipeline nodes (weeks 9-10)
 
-- ⬜ `git-source` (resolved commit SHA is the cache input)
-- ⬜ `image-build` (BuildKit or Docker, push to a local registry, resolve the digest)
+- 🔨 `git-source` (resolved commit SHA is the cache input)
+- 🔨 `image-build` (kaniko in a throwaway Job under PSA baseline; push + digest — design.md §6; live demo pending)
 - ⬜ `trivy-scan` (severity threshold, allowlist, DB-version or TTL cache dimension)
 - ⬜ Helm renderer
 - ⬜ Secrets handling and log masking

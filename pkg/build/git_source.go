@@ -1,6 +1,6 @@
 // Package build implements Stage 7 build-flow node types: source
-// resolution (git-source) and rootless BuildKit image builds that run
-// as throwaway Kubernetes Jobs (image-build), plus the Job-running
+// resolution (git-source) and kaniko image builds that run as
+// throwaway Kubernetes Jobs (image-build), plus the Job-running
 // primitive they share. The engine never imports this package — node
 // types register from cmd/afon — so pkg/engine stays free of
 // Kubernetes types (dependency rule: cmd → build → engine).

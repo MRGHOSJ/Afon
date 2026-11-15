@@ -318,8 +318,8 @@ func TestImageBuild_JobSpecDefaults(t *testing.T) {
 		t.Errorf("pod fsGroup = %v", pod.SecurityContext)
 	}
 	if pod.SecurityContext == nil || pod.SecurityContext.SeccompProfile == nil ||
-		pod.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined {
-		t.Errorf("pod seccomp (evidence: RuntimeDefault blocks rootlesskit) = %v", pod.SecurityContext)
+		pod.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("pod seccomp (kaniko: RuntimeDefault suffices, baseline PSA) = %v", pod.SecurityContext)
 	}
 
 	if len(pod.InitContainers) != 1 {
@@ -361,14 +361,17 @@ func TestImageBuild_JobSpecDefaults(t *testing.T) {
 		t.Fatalf("containers = %d", len(pod.Containers))
 	}
 	build := pod.Containers[0]
-	if build.Name != BuildContainerName || build.Image != buildkitImage {
+	if build.Name != BuildContainerName || build.Image != kanikoImage {
 		t.Errorf("build = %s/%s", build.Name, build.Image)
 	}
-	if len(build.Command) != 2 || build.Command[0] != "sh" || build.Command[1] != "-c" {
-		t.Errorf("build command = %v", build.Command)
+	// No shell: the image entrypoint /kaniko/executor receives the
+	// flags as argv elements — Command must stay nil (a reintroduced
+	// sh -c wrapper is a regression).
+	if build.Command != nil {
+		t.Errorf("build command = %v, want nil (image entrypoint /kaniko/executor)", build.Command)
 	}
-	if len(build.Env) != 1 || build.Env[0].Name != "DOCKER_CONFIG" || build.Env[0].Value != "/auth" {
-		t.Errorf("build env = %v", build.Env)
+	if len(build.Env) != 0 {
+		t.Errorf("build env = %v, want none (DOCKER_CONFIG is baked into the kaniko image)", build.Env)
 	}
 	if build.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
 		t.Errorf("terminationMessagePolicy = %s", build.TerminationMessagePolicy)
@@ -378,31 +381,35 @@ func TestImageBuild_JobSpecDefaults(t *testing.T) {
 		t.Errorf("default resources = %v", build.Resources)
 	}
 	bsc := build.SecurityContext
-	if bsc == nil || bsc.RunAsNonRoot == nil || !*bsc.RunAsNonRoot ||
-		bsc.AllowPrivilegeEscalation == nil || !*bsc.AllowPrivilegeEscalation ||
+	if bsc == nil || bsc.RunAsUser == nil || *bsc.RunAsUser != 0 ||
+		bsc.RunAsNonRoot == nil || *bsc.RunAsNonRoot ||
+		bsc.AllowPrivilegeEscalation == nil || *bsc.AllowPrivilegeEscalation ||
 		len(bsc.Capabilities.Drop) != 1 || bsc.Capabilities.Drop[0] != "ALL" ||
-		len(bsc.Capabilities.Add) != 2 || bsc.Capabilities.Add[0] != "SETUID" || bsc.Capabilities.Add[1] != "SETGID" {
-		t.Errorf("build securityContext (evidence: SETUID/SETGID must stay for newuidmap) = %+v", bsc)
+		len(bsc.Capabilities.Add) != 1 || bsc.Capabilities.Add[0] != "CHOWN" {
+		t.Errorf("build securityContext (baseline PSA: root, AE=false, CHOWN only) = %+v", bsc)
+	}
+	if bsc.ReadOnlyRootFilesystem != nil && *bsc.ReadOnlyRootFilesystem {
+		t.Errorf("readOnlyRootFilesystem must stay unset: kaniko unpacks into the container rootfs")
 	}
 
-	script := build.Args[0]
-	for _, want := range []string{
-		"buildctl-daemonless.sh build --frontend dockerfile.v0",
-		`--local ` + shQuote("context="+workspaceMount),
-		`--local ` + shQuote("dockerfile="+workspaceMount),
-		`--opt ` + shQuote("filename=Dockerfile"),
-		`--output ` + shQuote("type=image,name="+testImage+":"+testSHA+",push=true"),
-		`--metadata-file ` + metadataFilePath,
-		`sed -n ` + shQuote(`s/.*"containerimage\.digest": *"\([^"]*\)".*/\1/p`),
-		`> ` + terminationLog,
-	} {
-		if !strings.Contains(script, want) {
-			t.Errorf("build script missing %q:\n%s", want, script)
+	wantArgs := []string{
+		"--context=dir://" + workspaceMount,
+		"--dockerfile=Dockerfile",
+		"--destination=" + testImage + ":" + testSHA,
+		"--digest-file=" + terminationLog,
+	}
+	if len(build.Args) != len(wantArgs) {
+		t.Fatalf("build args = %v, want %v", build.Args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if build.Args[i] != want {
+			t.Errorf("build args[%d] = %q, want %q", i, build.Args[i], want)
 		}
 	}
-	for _, banned := range []string{"--opt 'target=", "--opt 'platform=", "--opt 'build-arg:", "jq"} {
-		if strings.Contains(script, banned) {
-			t.Errorf("build script must not contain %q:\n%s", banned, script)
+	joined := strings.Join(build.Args, " ")
+	for _, banned := range []string{"buildctl", "metadata-file", "sed ", "--no-push", "sh -c"} {
+		if strings.Contains(joined, banned) {
+			t.Errorf("build args must not contain %q: %v", banned, build.Args)
 		}
 	}
 	if len(build.VolumeMounts) != 2 {
@@ -483,24 +490,30 @@ func TestImageBuild_JobSpecOverrides(t *testing.T) {
 	if !strings.Contains(initScript, "cd "+shQuote(workspaceMount)) {
 		t.Errorf("init script should cd into the shared checkout: %s", initScript)
 	}
-	script := build.Args[0]
+	buildArgs := build.Args
+	joined := strings.Join(buildArgs, " ")
 	for _, want := range []string{
-		`--opt ` + shQuote("filename=sub/Dockerfile"),
-		`--local ` + shQuote("context=/workspace/app"),
-		`--local ` + shQuote("dockerfile=/workspace/app"),
-		`--opt ` + shQuote("target=prod"),
-		`--opt ` + shQuote("platform=linux/amd64"),
-		`--opt ` + shQuote("build-arg:A=1"),
-		`--opt ` + shQuote("build-arg:Z=9"),
+		"--context=dir://" + workspaceMount,
+		"--context-sub-path=app",
+		"--dockerfile=sub/Dockerfile",
+		"--target=prod",
+		"--custom-platform=linux/amd64",
+		"--build-arg=A=1",
+		"--build-arg=Z=9",
+		"--destination=" + testImage + ":" + testSHA,
+		"--digest-file=" + terminationLog,
 	} {
-		if !strings.Contains(script, want) {
-			t.Errorf("build script missing %q:\n%s", want, script)
+		if !strings.Contains(joined, want) {
+			t.Errorf("build args missing %q:\n%v", want, buildArgs)
 		}
 	}
-	iA := strings.Index(script, "build-arg:A=1")
-	iZ := strings.Index(script, "build-arg:Z=9")
+	iA := strings.Index(joined, "--build-arg=A=1")
+	iZ := strings.Index(joined, "--build-arg=Z=9")
 	if iA < 0 || iZ < 0 || iA > iZ {
-		t.Errorf("build args must be sorted A before Z:\n%s", script)
+		t.Errorf("build args must be sorted A before Z:\n%v", buildArgs)
+	}
+	if build.Command != nil {
+		t.Errorf("build command = %v, want nil (no shell wrapper)", build.Command)
 	}
 }
 
@@ -516,7 +529,8 @@ func TestImageBuild_ShQuoteKeepsInjectionQuoted(t *testing.T) {
 	if _, err := (ImageBuild{}).RunCluster(context.Background(), cfg, engine.Inputs{}, fastRunner(client)); err != nil {
 		t.Fatalf("RunCluster: %v", err)
 	}
-	initScript := job.Spec.Template.Spec.InitContainers[0].Args[0]
+	pod := job.Spec.Template.Spec
+	initScript := pod.InitContainers[0].Args[0]
 	wantRepo := shQuote(nasty)
 	if !strings.Contains(initScript, wantRepo) {
 		t.Errorf("repo not quoted (%s): %s", wantRepo, initScript)
@@ -527,9 +541,21 @@ func TestImageBuild_ShQuoteKeepsInjectionQuoted(t *testing.T) {
 	if !strings.Contains(initScript, shQuote("deadbeef; rm -rf /")) {
 		t.Errorf("sha not quoted: %s", initScript)
 	}
-	buildScript := job.Spec.Template.Spec.Containers[0].Args[0]
-	if !strings.Contains(buildScript, shQuote("build-arg:K=v'; echo pwned")) {
-		t.Errorf("build arg not quoted: %s", buildScript)
+	// The kaniko side has no shell: the nasty build-arg value must
+	// arrive verbatim as one argv element (no quoting needed, nothing
+	// to inject into).
+	build := pod.Containers[0]
+	if build.Command != nil {
+		t.Errorf("build command = %v, want nil (no shell to inject into)", build.Command)
+	}
+	found := false
+	for _, a := range build.Args {
+		if a == "--build-arg=K=v'; echo pwned" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("build arg must pass verbatim as argv: %v", build.Args)
 	}
 }
 

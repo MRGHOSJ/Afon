@@ -202,7 +202,33 @@ These decisions landed with the apply-safeguard stage; each exists to stop a spe
 6. **Header vs banner — both exist on purpose.** Text mode prints a header on stdout after planning (`driver: k8s context: … namespace: … force: … prune: …`); a one-line banner on stderr prints after config parsing but *before* connecting. The banner is the only context signal in `-o json` mode (the header is text-only; Plan JSON carries no target) and when discovery fails (the header never prints). Known limitation: the header's k8s form is verified by unit test (`TestPrintPlanHeader`) and live demo only — hermetic end-to-end verification needs a fake discovery path, deferred.
 7. **`render --check` is an exit-code contract.** Stale/edited/missing files → exit 1 with `render --check: N file(s) not up to date`; stdout keeps printing the would-be content (the `terraform fmt -check` style), so a CI log shows the diff that was refused.
 
-## 6. Open questions
+## 6. Image-build node (Stage 7)
+
+`git-source` checks out a resolved commit; `image-build` runs a full Dockerfile build in a throwaway Kubernetes Job and outputs the pushed content digest (`digest`, `ref` — deploys consume `image@sha256:…`, never a tag). The git checkout runs as the init container; the kaniko container writes `sha256:<hex>` to `/dev/termination-log`, which the node parses (`^sha256:[0-9a-f]{64}$`; on failure the empty log falls back to the tail of kaniko's output via `terminationMessagePolicy: FallbackToLogsOnError`). The Job is always deleted after the run — `ttlSecondsAfterFinished: 600` is the leak net only if the afon process dies first. Cache inputs are exactly `{sha, image, dockerfile, context, target, platform, sorted args}`; repo location, secret names, namespace, resources and timeout are deliberately excluded (design §1).
+
+### Builder: kaniko, not BuildKit
+
+- **Pin:** `ghcr.io/osscontainertools/kaniko:v1.29.0@sha256:0c0b6c02991bba44090fad918ae177d193e1bd3fd0ccc643e7cc1f9f1a5a373d` — tag + digest locked in code. Full image, not `slim`: the slim variant drops GCR/ECR/ACR auth and the gs/s3/azure/git build contexts. v1.29.0 is the release that graduates the cache-lookahead flags; on unchanged builds the community fork measures 9.9s vs BuildKit 6.1s and Google's last kaniko 45.6s ([OSSCT-2026-001 — kaniko and BuildKit: 8 years later](https://osscontainertools.org/blog/kaniko-vs-buildkit-2026/)).
+- **Why the pivot (evidence):** live rounds on k3d-dev (k3s v1.35.5+k3s1, 2026-11-14) found the only working BuildKit posture was PSA `privileged` + seccomp `Unconfined` + `allowPrivilegeEscalation: true` + `drop: [ALL]` with `add: [SETUID, SETGID]` — round 7 of 7, each earlier round failing at exactly one of those points (rootlesskit's `newuidmap` exec needs the caps and the unconfined profile). Kaniko needs none of it: no daemon, no user namespace, no rootlesskit, so the build namespace sits at PSA **baseline** instead of privileged. The BuildKit rounds are recorded here as the justification, not as the configuration.
+- **Pod posture (verified live, baseline namespace, 2026-11-15):** build container `runAsUser: 0`, `runAsNonRoot: false`, `allowPrivilegeEscalation: false`, `capabilities: {drop: [ALL], add: [CHOWN]}`, pod seccomp `RuntimeDefault`. `readOnlyRootFilesystem` is deliberately unset — kaniko unpacks the base image into its own rootfs (documented baseline relaxation). The git init container stays non-root (`runAsUser: 1000`, drop ALL).
+- **Namespace:** `afon-build` by default (`namespace` config overrides), labeled `pod-security.kubernetes.io/enforce: baseline` (+ audit/warn). Afon never edits namespace labels; a PSA refusal surfaces as a Job admission error and the runner's hint names the labels to add.
+- **Kaniko's own layer cache is not configured** in Stage 7 (`--cache`/`--cache-repo` omitted): afon's action cache is the primary — a miss runs a fresh build. Layer caching is a later optimization.
+
+### Flags (verified against v1.29.0 `--help`)
+
+`--context=dir:///workspace`, `--context-sub-path=<context>` (omitted when context is `.`), `--dockerfile=<path relative to the (sub)context>` (verified live: `--context-sub-path=app --dockerfile=sub/Dockerfile` resolves under `app/`), `--destination=<image>:<git-sha>` (always passed — v1.29.0 validates `KANIKO_NO_PUSH` against it), `--digest-file=/dev/termination-log` (writes `sha256:<hex>` even under `--no-push`; on a real push it is the pushed digest), `--target`, `--custom-platform` (kaniko has no `--platform` flag), `--build-arg=K=V` sorted. No shell: the container's `Command` is nil and the image entrypoint `/kaniko/executor` receives the flags as argv — no injection surface; `shQuote` remains only for the git-init script.
+
+### Secrets and RBAC
+
+- **Registry credentials:** a `kubernetes.io/dockerconfigjson` Secret in the BUILD namespace, mounted with an explicit items projection (`key: .dockerconfigjson → path: config.json`) into the image's own `DOCKER_CONFIG` dir (`/kaniko/.docker`). A wrong-shaped Secret fails as a `FailedMount` event. Afon never gets, lists, or creates Secrets from the build runner.
+- **Git credentials (optional):** Secret key `credential` (v1 = HTTPS PAT; SSH deferred to `afon secret set-git`), mounted read-only into the init container only.
+- **Job RBAC the runner needs:** `jobs` create/get/list/watch/delete, `pods` get/list/watch, `events` list/watch. **No Secret verbs** — the runner never reads Secrets (release records flow through the driver backend, a different client).
+
+### Stage 8 candidate: `afon secret`
+
+`afon secret` (set-registry, list; masked prompt + `--password-stdin`) — pending approval of `x/term`. Notes: the docker.io auth key is probably `https://index.docker.io/v1/`; a Secret's type is not in ObjectMeta, so metadata-only type checks are impossible; created Secrets get a label distinct from the Job label so sweeps never match them; `set-git` and app secrets come after registry works; wording must stay honest — base64 is encoding not encryption, RBAC decides who can read, at-rest encryption is the cluster's business.
+
+## 7. Open questions
 
 1. Name and schema group: the code uses `afon`, and it ends up in labels and API versions, so settle it before the first release.
 2. Hooks (migrations that must finish before a Deployment): excluded from v1, with `needs` as the likely mechanism.

@@ -80,7 +80,7 @@ func succeededPod(message string) *corev1.Pod {
 
 func TestNewJobSpec(t *testing.T) {
 	timeout := 20 * time.Minute
-	build := corev1.Container{Name: "buildkit", Image: "img"}
+	build := corev1.Container{Name: "kaniko", Image: "img"}
 	init := corev1.Container{Name: "git-checkout", Image: "git-img"}
 	vol := corev1.Volume{Name: "workspace"}
 	job := newJob(JobParams{
@@ -109,7 +109,7 @@ func TestNewJobSpec(t *testing.T) {
 	if len(job.Spec.Template.Spec.InitContainers) != 1 || job.Spec.Template.Spec.InitContainers[0].Name != "git-checkout" {
 		t.Errorf("init containers = %v", job.Spec.Template.Spec.InitContainers)
 	}
-	if len(job.Spec.Template.Spec.Containers) != 1 || job.Spec.Template.Spec.Containers[0].Name != "buildkit" {
+	if len(job.Spec.Template.Spec.Containers) != 1 || job.Spec.Template.Spec.Containers[0].Name != "kaniko" {
 		t.Errorf("containers = %v", job.Spec.Template.Spec.Containers)
 	}
 	if len(job.Spec.Template.Spec.Volumes) != 1 {
@@ -159,12 +159,12 @@ func TestRunner_FailedContainerFailsAndDeletes(t *testing.T) {
 	pod := succeededPod("")
 	pod.Status.Phase = corev1.PodFailed
 	pod.Status.ContainerStatuses[0].State.Terminated.ExitCode = 1
-	pod.Status.ContainerStatuses[0].State.Terminated.Message = "buildctl exploded"
+	pod.Status.ContainerStatuses[0].State.Terminated.Message = "kaniko exploded"
 	client := onJobCreate(t, pod)
 	r := fastRunner(client)
 	_, err := r.RunJob(context.Background(), testNS, testJob("run2"), BuildContainerName)
-	if err == nil || !strings.Contains(err.Error(), "buildctl exploded") {
-		t.Fatalf("err = %v, want buildctl exploded", err)
+	if err == nil || !strings.Contains(err.Error(), "kaniko exploded") {
+		t.Fatalf("err = %v, want kaniko exploded", err)
 	}
 	if _, err := client.BatchV1().Jobs(testNS).Get(context.Background(), jobNameFor("run2"), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Errorf("job should be deleted after failure, get err = %v", err)
@@ -352,7 +352,7 @@ func TestSweepJobsByLabel(t *testing.T) {
 	client := fake.NewClientset()
 	mk := func(name, runID string) *batchv1.Job {
 		j := newJob(JobParams{Name: name, RunID: runID, Namespace: testNS, Timeout: time.Minute,
-			Build: corev1.Container{Name: "buildkit"}})
+			Build: corev1.Container{Name: "kaniko"}})
 		return j
 	}
 	for _, j := range []*batchv1.Job{
