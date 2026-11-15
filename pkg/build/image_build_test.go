@@ -335,8 +335,15 @@ func TestImageBuild_JobSpecDefaults(t *testing.T) {
 		len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" {
 		t.Errorf("init securityContext = %+v", sc)
 	}
-	if len(init.Env) != 1 || init.Env[0].Name != "GIT_TERMINAL_PROMPT" || init.Env[0].Value != "0" {
+	if len(init.Env) != 4 || init.Env[0].Name != "GIT_TERMINAL_PROMPT" || init.Env[0].Value != "0" {
 		t.Errorf("init env = %v", init.Env)
+	}
+	initEnv := map[string]string{}
+	for _, e := range init.Env {
+		initEnv[e.Name] = e.Value
+	}
+	if initEnv["GIT_CONFIG_COUNT"] != "1" || initEnv["GIT_CONFIG_KEY_0"] != "safe.directory" || initEnv["GIT_CONFIG_VALUE_0"] != workspaceMount {
+		t.Errorf("init env must whitelist the workspace for git (dubious-ownership fix): %v", init.Env)
 	}
 	initScript := init.Args[0]
 	if !strings.Contains(initScript, "git remote add origin "+shQuote(testRepoURL)) {
@@ -385,8 +392,9 @@ func TestImageBuild_JobSpecDefaults(t *testing.T) {
 		bsc.RunAsNonRoot == nil || *bsc.RunAsNonRoot ||
 		bsc.AllowPrivilegeEscalation == nil || *bsc.AllowPrivilegeEscalation ||
 		len(bsc.Capabilities.Drop) != 1 || bsc.Capabilities.Drop[0] != "ALL" ||
-		len(bsc.Capabilities.Add) != 1 || bsc.Capabilities.Add[0] != "CHOWN" {
-		t.Errorf("build securityContext (baseline PSA: root, AE=false, CHOWN only) = %+v", bsc)
+		len(bsc.Capabilities.Add) != 3 || bsc.Capabilities.Add[0] != "CHOWN" ||
+		bsc.Capabilities.Add[1] != "DAC_OVERRIDE" || bsc.Capabilities.Add[2] != "FOWNER" {
+		t.Errorf("build securityContext (baseline PSA: root, AE=false, CHOWN+DAC_OVERRIDE+FOWNER) = %+v", bsc)
 	}
 	if bsc.ReadOnlyRootFilesystem != nil && *bsc.ReadOnlyRootFilesystem {
 		t.Errorf("readOnlyRootFilesystem must stay unset: kaniko unpacks into the container rootfs")

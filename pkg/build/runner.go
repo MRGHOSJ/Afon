@@ -69,11 +69,6 @@ func (r *Runner) RunJob(ctx context.Context, ns string, job *batchv1.Job, messag
 			}
 			return "", fmt.Errorf("reading build job %q: %w", created.Name, err)
 		}
-		if cond, failed := jobCondition(j, batchv1.JobFailed); failed {
-			return "", r.withEvents(ns, created.Name, fmt.Errorf(
-				"build job failed (%s): %s", cond.Reason, cond.Message))
-		}
-
 		pods, err := r.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
 			LabelSelector: labels.Set{RunIDLabel: runID}.String(),
 		})
@@ -83,38 +78,57 @@ func (r *Runner) RunJob(ctx context.Context, ns string, job *batchv1.Job, messag
 			}
 			return "", fmt.Errorf("listing build pods: %w", err)
 		}
-		if len(pods.Items) == 0 {
-			continue
-		}
-		pod := pods.Items[0]
-		lastPod = pod.Name
+		if len(pods.Items) > 0 {
+			pod := pods.Items[0]
+			lastPod = pod.Name
 
-		// Success: the message container terminated cleanly.
-		if cs := containerStatus(pod, messageContainer); cs != nil &&
-			cs.State.Terminated != nil && cs.State.Terminated.ExitCode == 0 {
-			return cs.State.Terminated.Message, nil
-		}
-		// Any container that exited non-zero fails the Job — this
-		// catches a failed git init before the build ever starts.
-		for _, cs := range pod.Status.ContainerStatuses {
-			if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
-				msg := strings.TrimSpace(t.Message)
-				if msg == "" {
-					msg = fmt.Sprintf("container %q exited with code %d", cs.Name, t.ExitCode)
+			// Success: the message container terminated cleanly.
+			if cs := containerStatus(pod, messageContainer); cs != nil &&
+				cs.State.Terminated != nil && cs.State.Terminated.ExitCode == 0 {
+				return cs.State.Terminated.Message, nil
+			}
+			// An init container that exited non-zero failed the pod
+			// before the build started. Inspect pods before the Job
+			// condition so this detail is not masked by
+			// BackoffLimitExceeded.
+			for _, cs := range pod.Status.InitContainerStatuses {
+				if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
+					if msg := strings.TrimSpace(t.Message); msg != "" {
+						return "", r.withEvents(ns, pod.Name, fmt.Errorf(
+							"build failed: init container %q exited with code %d: %s", cs.Name, t.ExitCode, msg))
+					}
+					return "", r.withEvents(ns, pod.Name, fmt.Errorf(
+						"build failed: init container %q exited with code %d", cs.Name, t.ExitCode))
 				}
-				return "", r.withEvents(ns, pod.Name, fmt.Errorf("build failed: %s", msg))
+			}
+			// Any container that exited non-zero fails the Job.
+			for _, cs := range pod.Status.ContainerStatuses {
+				if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
+					msg := strings.TrimSpace(t.Message)
+					if msg == "" {
+						msg = fmt.Sprintf("container %q exited with code %d", cs.Name, t.ExitCode)
+					}
+					return "", r.withEvents(ns, pod.Name, fmt.Errorf("build failed: %s", msg))
+				}
+			}
+			// Pull errors never resolve on their own: fail fast with the
+			// image name instead of waiting out the timeout.
+			for _, cs := range pod.Status.ContainerStatuses {
+				if w := cs.State.Waiting; w != nil &&
+					(w.Reason == "ErrImagePull" || w.Reason == "ImagePullBackOff") {
+					return "", fmt.Errorf("pulling image for container %q: %s: %s", cs.Name, w.Reason, w.Message)
+				}
+			}
+			if pod.Status.Phase == corev1.PodFailed {
+				return "", r.withEvents(ns, pod.Name, fmt.Errorf("build pod failed: %s", pod.Status.Reason))
 			}
 		}
-		// Pull errors never resolve on their own: fail fast with the
-		// image name instead of waiting out the timeout.
-		for _, cs := range pod.Status.ContainerStatuses {
-			if w := cs.State.Waiting; w != nil &&
-				(w.Reason == "ErrImagePull" || w.Reason == "ImagePullBackOff") {
-				return "", fmt.Errorf("pulling image for container %q: %s: %s", cs.Name, w.Reason, w.Message)
-			}
-		}
-		if pod.Status.Phase == corev1.PodFailed {
-			return "", r.withEvents(ns, pod.Name, fmt.Errorf("build pod failed: %s", pod.Status.Reason))
+		// No pod detail to report (or none that failed): the Job's own
+		// condition is the verdict — deadline, backoff, or a pod the
+		// controller already swept away.
+		if cond, failed := jobCondition(j, batchv1.JobFailed); failed {
+			return "", r.withEvents(ns, created.Name, fmt.Errorf(
+				"build job failed (%s): %s", cond.Reason, cond.Message))
 		}
 	}
 }

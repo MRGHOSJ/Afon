@@ -542,7 +542,12 @@ git checkout -q -f %s
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: workspaceVolume, MountPath: workspaceMount},
 		},
-		Env: []corev1.EnvVar{{Name: "GIT_TERMINAL_PROMPT", Value: "0"}},
+		Env: []corev1.EnvVar{
+			{Name: "GIT_TERMINAL_PROMPT", Value: "0"},
+			{Name: "GIT_CONFIG_COUNT", Value: "1"},
+			{Name: "GIT_CONFIG_KEY_0", Value: "safe.directory"},
+			{Name: "GIT_CONFIG_VALUE_0", Value: workspaceMount},
+		},
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:    ptr(buildUser),
 			RunAsGroup:   ptr(buildUser),
@@ -615,17 +620,26 @@ func buildContainer(s *imageBuildSpec) corev1.Container {
 			// runs as root inside an ordinary container (verified
 			// baseline-PSA round 2026-11-15: admitted + built clean
 			// with this exact posture). No user namespace, no
-			// rootlesskit, no privilege escalation needed — CAP_CHOWN
-			// is the only added capability (kaniko chowns unpacked
-			// files); everything else dropped. readOnlyRootFilesystem
-			// is deliberately unset: the unpack writes the container
-			// rootfs (documented baseline relaxation in design.md).
+			// rootlesskit, no privilege escalation needed — three
+			// added capabilities, all baseline-PSA-allowed:
+			// CAP_CHOWN (kaniko chowns copied files to the source
+			// owner), CAP_FOWNER (NoAtimeFS opens every workspace
+			// file with O_NOATIME, which requires owning the file
+			// or CAP_FOWNER — the checkout is owned by the git
+			// init container's uid 1000, not root), and
+			// CAP_DAC_OVERRIDE (the final "Deleting filesystem"
+			// cleanup must unlink the Go module cache, whose
+			// directories go mod download chmods to 0555 — mode
+			// bits deny even root without it); everything else
+			// dropped. readOnlyRootFilesystem is deliberately
+			// unset: the unpack writes the container rootfs
+			// (documented baseline relaxation in design.md).
 			RunAsUser:                ptr(int64(0)),
 			RunAsNonRoot:             ptr(false),
 			AllowPrivilegeEscalation: ptr(false),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
-				Add:  []corev1.Capability{"CHOWN"},
+				Add:  []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER"},
 			},
 		},
 	}

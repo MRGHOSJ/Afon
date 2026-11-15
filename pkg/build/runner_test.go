@@ -176,13 +176,15 @@ func TestRunner_InitFailureFailsFast(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "buildpod-1"},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodFailed,
-			ContainerStatuses: []corev1.ContainerStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{
 				{
-					Name: "git-checkout",
+					Name: GitInitContainerName,
 					State: corev1.ContainerState{
 						Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: "fatal: repository not found"},
 					},
 				},
+			},
+			ContainerStatuses: []corev1.ContainerStatus{
 				{
 					Name:  BuildContainerName,
 					State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
@@ -195,6 +197,56 @@ func TestRunner_InitFailureFailsFast(t *testing.T) {
 	_, err := r.RunJob(context.Background(), testNS, testJob("run3"), BuildContainerName)
 	if err == nil || !strings.Contains(err.Error(), "fatal: repository not found") {
 		t.Fatalf("err = %v, want git failure message", err)
+	}
+}
+
+// A Job-level failure (backoff limit after a failed init) must not
+// mask the pod's init-container detail — that is exactly how the
+// live demo failure surfaced (empty "build pod failed: " behind
+// BackoffLimitExceeded).
+func TestRunner_JobFailedStillSurfacesInitDetail(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "buildpod-1"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: GitInitContainerName,
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 128},
+					},
+				},
+			},
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name:  BuildContainerName,
+					State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+				},
+			},
+		},
+	}
+	client := fake.NewClientset()
+	client.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		job := action.(k8stesting.CreateAction).GetObject().(*batchv1.Job)
+		job.Status.Conditions = []batchv1.JobCondition{{
+			Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
+			Reason: "BackoffLimitExceeded", Message: "Job has reached the specified backoff limit",
+		}}
+		if err := client.Tracker().Create(batchv1.SchemeGroupVersion.WithResource("jobs"), job, job.Namespace); err != nil {
+			return true, nil, err
+		}
+		p := pod.DeepCopy()
+		p.Namespace = job.Namespace
+		p.Labels = map[string]string{RunIDLabel: job.Labels[RunIDLabel]}
+		return true, job, client.Tracker().Create(corev1.SchemeGroupVersion.WithResource("pods"), p, p.Namespace)
+	})
+	r := fastRunner(client)
+	_, err := r.RunJob(context.Background(), testNS, testJob("run11"), BuildContainerName)
+	if err == nil || !strings.Contains(err.Error(), `init container "git-checkout" exited with code 128`) {
+		t.Fatalf("err = %v, want init container detail", err)
+	}
+	if strings.Contains(err.Error(), "BackoffLimitExceeded") {
+		t.Errorf("init detail must win over the job condition, got: %v", err)
 	}
 }
 
