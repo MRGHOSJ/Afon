@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -315,4 +317,42 @@ func TestConfirmDeletes(t *testing.T) {
 	t.Run("tty n aborts", func(t *testing.T) { no(t, "n\n") })
 	t.Run("tty empty aborts", func(t *testing.T) { no(t, "") })
 	t.Run("tty junk aborts", func(t *testing.T) { no(t, "sure\n") })
+}
+
+// ensDriver is bareDriver plus the optional NamespaceEnsurer
+// capability, recording calls.
+type ensDriver struct {
+	bareDriver
+	called []string
+	err    error
+}
+
+func (e *ensDriver) EnsureNamespace(_ context.Context, name string) error {
+	e.called = append(e.called, name)
+	return e.err
+}
+
+// ensureTargetNamespace type-asserts the optional capability: drivers
+// without it are a no-op (the fake driver manages no namespaces), a
+// driver with it receives the namespace, and a capability failure
+// propagates to the caller.
+func TestEnsureTargetNamespace(t *testing.T) {
+	ctx := context.Background()
+
+	if err := ensureTargetNamespace(ctx, bareDriver{}, "demo"); err != nil {
+		t.Fatalf("capability-less driver must be a no-op, got: %v", err)
+	}
+
+	e := &ensDriver{}
+	if err := ensureTargetNamespace(ctx, e, "demo"); err != nil {
+		t.Fatalf("ensuring: %v", err)
+	}
+	if len(e.called) != 1 || e.called[0] != "demo" {
+		t.Fatalf("called = %v, want [demo]", e.called)
+	}
+
+	fail := &ensDriver{err: errors.New("boom")}
+	if err := ensureTargetNamespace(ctx, fail, "demo"); err == nil {
+		t.Fatal("want capability error to propagate")
+	}
 }

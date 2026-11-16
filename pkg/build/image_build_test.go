@@ -19,7 +19,7 @@ import (
 const (
 	testSHA      = "0123456789abcdef0123456789abcdef0123456789"
 	testDigest   = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	testImage    = "docker.io/example/app"
+	testImage    = "127.0.0.1:1/example/app"
 	testRepoURL  = "https://github.com/example/app.git"
 	testRegistry = "dockerhub-creds"
 )
@@ -35,7 +35,7 @@ func validCfg() map[string]any {
 
 func TestImageBuild_TypeAndOutputs(t *testing.T) {
 	n := ImageBuild{}
-	if n.Type() != "image-build" || n.TypeVersion() != "1" || n.Kind() != engine.KindAction {
+	if n.Type() != "image-build" || n.TypeVersion() != "2" || n.Kind() != engine.KindAction {
 		t.Errorf("meta: %s/%s %s", n.Type(), n.TypeVersion(), n.Kind())
 	}
 	got := n.DeclaredOutputs()
@@ -400,9 +400,14 @@ func TestImageBuild_JobSpecDefaults(t *testing.T) {
 		t.Errorf("readOnlyRootFilesystem must stay unset: kaniko unpacks into the container rootfs")
 	}
 
+	wantSpec, err := imageBuildConfig(validCfg())
+	if err != nil {
+		t.Fatal(err)
+	}
 	wantArgs := []string{
 		"--context=dir://" + workspaceMount,
 		"--dockerfile=Dockerfile",
+		"--label=" + configLabelKey + "=" + wantSpec.contentKey(),
 		"--destination=" + testImage + ":" + testSHA,
 		"--digest-file=" + terminationLog,
 	}
@@ -500,6 +505,10 @@ func TestImageBuild_JobSpecOverrides(t *testing.T) {
 	}
 	buildArgs := build.Args
 	joined := strings.Join(buildArgs, " ")
+	ovSpec, err := imageBuildConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{
 		"--context=dir://" + workspaceMount,
 		"--context-sub-path=app",
@@ -508,6 +517,7 @@ func TestImageBuild_JobSpecOverrides(t *testing.T) {
 		"--custom-platform=linux/amd64",
 		"--build-arg=A=1",
 		"--build-arg=Z=9",
+		"--label=" + configLabelKey + "=" + ovSpec.contentKey(),
 		"--destination=" + testImage + ":" + testSHA,
 		"--digest-file=" + terminationLog,
 	} {

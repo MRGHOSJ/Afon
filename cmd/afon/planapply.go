@@ -174,6 +174,20 @@ func clusterValue(r *build.Runner) any {
 	return r
 }
 
+// ensureTargetNamespace creates the flow's target namespace when the
+// driver supports it (k8s) — called only from apply and rollback, the
+// mutating commands, before any release record or object is written.
+// Plan, validate, status and history never call it, so they stay
+// side-effect-free. Drivers without the capability (fake) need no
+// namespace.
+func ensureTargetNamespace(ctx context.Context, d driver.Driver, ns string) error {
+	ens, ok := d.(driver.NamespaceEnsurer)
+	if !ok {
+		return nil
+	}
+	return ens.EnsureNamespace(ctx, ns)
+}
+
 // planPruneBackend returns the backend plan should prune inventory
 // with — nil when pruning is off (--no-prune), so the inventory half
 // of pruning agrees with the driver's label-prune half.
@@ -262,6 +276,11 @@ func runApply(ctx context.Context) error {
 	}
 	d, runner, ctxName, backend, err := buildDriver(stateDir, cf.Target, cf.Name)
 	if err != nil {
+		return err
+	}
+	// Before BuildPlanOpts: apply re-plans internally, and the plan
+	// phase refuses a missing target namespace — create it first.
+	if err := ensureTargetNamespace(ctx, d, cf.Target.Namespace); err != nil {
 		return err
 	}
 

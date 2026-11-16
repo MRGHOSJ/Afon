@@ -72,6 +72,9 @@ func runRollback(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := ensureTargetNamespace(ctx, d, cf.Target.Namespace); err != nil {
+		return err
+	}
 
 	to := flagRollbackTo
 	switch {

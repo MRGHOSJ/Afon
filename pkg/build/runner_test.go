@@ -460,3 +460,79 @@ func TestRunner_JobVanishedMidRun(t *testing.T) {
 		t.Fatalf("err = %v, want deleted while running", err)
 	}
 }
+
+func TestRunJobCreatesMissingNamespace(t *testing.T) {
+	client := onJobCreate(t, succeededPod("msg"))
+	r := fastRunner(client)
+	if _, err := r.RunJob(context.Background(), testNS, testJob("ns1"), BuildContainerName); err != nil {
+		t.Fatalf("RunJob: %v", err)
+	}
+	ns, err := client.CoreV1().Namespaces().Get(context.Background(), testNS, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("namespace after run: %v", err)
+	}
+	for _, k := range []string{
+		"pod-security.kubernetes.io/enforce",
+		"pod-security.kubernetes.io/audit",
+		"pod-security.kubernetes.io/warn",
+	} {
+		if ns.Labels[k] != "baseline" {
+			t.Errorf("label %s = %q, want baseline", k, ns.Labels[k])
+		}
+	}
+}
+
+func TestRunJobExistingNamespaceUntouched(t *testing.T) {
+	client := onJobCreate(t, succeededPod("msg"))
+	want := map[string]string{"custom": "value"}
+	if _, err := client.CoreV1().Namespaces().Create(context.Background(), &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: testNS, Labels: want},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r := fastRunner(client)
+	if _, err := r.RunJob(context.Background(), testNS, testJob("ns2"), BuildContainerName); err != nil {
+		t.Fatalf("RunJob: %v", err)
+	}
+	ns, err := client.CoreV1().Namespaces().Get(context.Background(), testNS, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ns.Labels) != 1 || ns.Labels["custom"] != "value" {
+		t.Errorf("existing namespace labels were modified: %v", ns.Labels)
+	}
+}
+
+func TestRunJobNamespaceCreateForbidden(t *testing.T) {
+	client := fake.NewClientset()
+	client.PrependReactor("create", "namespaces", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "namespaces"},
+			testNS, errors.New("no permission"))
+	})
+	client.PrependReactor("create", "jobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		t.Error("jobs must not be created when the namespace cannot be created")
+		return true, nil, errors.New("unreachable")
+	})
+	r := fastRunner(client)
+	_, err := r.RunJob(context.Background(), testNS, testJob("ns3"), BuildContainerName)
+	if err == nil {
+		t.Fatal("expected namespace-creation error")
+	}
+	if !strings.Contains(err.Error(), `build namespace "afon-build" does not exist and afon cannot create it`) {
+		t.Errorf("err = %v, want directive about the missing namespace", err)
+	}
+	if !strings.Contains(err.Error(), "kubectl create namespace afon-build") {
+		t.Errorf("err = %v, want manual-creation hint", err)
+	}
+}
+
+func TestRunJobNamespaceAlreadyExistsRace(t *testing.T) {
+	client := onJobCreate(t, succeededPod("msg"))
+	client.PrependReactor("create", "namespaces", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewAlreadyExists(schema.GroupResource{Resource: "namespaces"}, testNS)
+	})
+	r := fastRunner(client)
+	if _, err := r.RunJob(context.Background(), testNS, testJob("ns4"), BuildContainerName); err != nil {
+		t.Fatalf("AlreadyExists on create must be success, got: %v", err)
+	}
+}

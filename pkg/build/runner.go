@@ -41,6 +41,9 @@ func NewRunner(client kubernetes.Interface) *Runner {
 // an error enriched with pod/job events so mount and admission
 // problems are legible without kubectl.
 func (r *Runner) RunJob(ctx context.Context, ns string, job *batchv1.Job, messageContainer string) (string, error) {
+	if err := r.ensureNamespace(ctx, ns); err != nil {
+		return "", err
+	}
 	created, err := r.client.BatchV1().Jobs(ns).Create(ctx, job, metav1.CreateOptions{})
 	if err != nil {
 		return "", r.wrapCreate(ns, err)
@@ -143,6 +146,42 @@ func (r *Runner) wrapCreate(ns string, err error) error {
 	}
 	return fmt.Errorf("%w (admission rejected the pod security settings; the namespace needs an appropriate "+
 		"pod-security.kubernetes.io/enforce label for the build pod — Afon never modifies namespace labels)", base)
+}
+
+// baselineLabels are the PSA-baseline labels design.md requires on a
+// build namespace (kaniko's posture is baseline-admitted).
+var baselineLabels = map[string]string{
+	"pod-security.kubernetes.io/enforce": "baseline",
+	"pod-security.kubernetes.io/audit":   "baseline",
+	"pod-security.kubernetes.io/warn":    "baseline",
+}
+
+// ensureNamespace creates ns with the baseline PSA labels when it does
+// not exist, so a fresh cluster needs no manual kubectl setup. An
+// existing namespace is never modified (Afon never edits namespace
+// labels — a pre-existing mislabeled namespace still surfaces the
+// admission hint in wrapCreate). AlreadyExists from a concurrent
+// create is success; a forbidden create is a directive, not a raw API
+// error.
+func (r *Runner) ensureNamespace(ctx context.Context, ns string) error {
+	_, err := r.client.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("checking build namespace %q: %w", ns, err)
+	}
+	_, err = r.client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: baselineLabels},
+	}, metav1.CreateOptions{})
+	if err == nil || apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+		return fmt.Errorf("build namespace %q does not exist and afon cannot create it: %w "+
+			"(create it manually: kubectl create namespace %s)", ns, err, ns)
+	}
+	return fmt.Errorf("creating build namespace %q: %w", ns, err)
 }
 
 func mentionsPodSecurity(msg string) bool {

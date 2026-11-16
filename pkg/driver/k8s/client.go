@@ -149,6 +149,37 @@ func (d *Driver) checkNamespace(ctx context.Context) error {
 	return nil
 }
 
+// EnsureNamespace implements driver.NamespaceEnsurer: create the
+// target namespace when it is missing, so a fresh cluster needs no
+// manual kubectl setup. The namespace is created plain — no labels
+// (they are the operator's to configure) — and an existing namespace
+// is never modified. AlreadyExists from a concurrent create is
+// success; a forbidden create is a directive naming the manual
+// command, not a raw API error.
+func (d *Driver) EnsureNamespace(ctx context.Context, name string) error {
+	_, err := d.dyn.Resource(nsGVR).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("checking namespace %q: %w", name, err)
+	}
+	ns := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata":   map[string]any{"name": name},
+	}}
+	_, err = d.dyn.Resource(nsGVR).Create(ctx, ns, metav1.CreateOptions{})
+	if err == nil || apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) {
+		return fmt.Errorf("target namespace %q does not exist and afon cannot create it: %w "+
+			"(create it manually: kubectl create namespace %s)", name, err, name)
+	}
+	return fmt.Errorf("creating namespace %q: %w", name, err)
+}
+
 // applyBody builds the SSA payload from a desired object. The Object's
 // identity fields are authoritative: when Data carries the same fields
 // they must agree (a contradiction is an error, never a silent

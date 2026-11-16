@@ -33,7 +33,7 @@ func TestFlow_ImageBuildGitToDigest(t *testing.T) {
 		t.Skip("git not in PATH")
 	}
 	const testDigest = "sha256:" + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	const wantRef = "docker.io/example/app@" + testDigest
+	const wantRef = "127.0.0.1:1/example/app@" + testDigest
 
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "repo")
@@ -80,7 +80,7 @@ spec:
     - id: build
       type: image-build
       config:
-        image: docker.io/example/app
+        image: 127.0.0.1:1/example/app
         repo: ${src.url}
         sha: ${src.sha}
         registrySecret: dockerhub-creds

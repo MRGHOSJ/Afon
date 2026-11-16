@@ -75,8 +75,10 @@ var (
 func (ImageBuild) Type() string { return "image-build" }
 
 // TypeVersion implements engine.NodeType. Bump when the job shape or
-// cache inputs change.
-func (ImageBuild) TypeVersion() string { return "1" }
+// cache inputs change (2: the afon.dev.build-config label + registry
+// pre-check landed; old cached jobs rebuild once, then the registry
+// itself carries the proof).
+func (ImageBuild) TypeVersion() string { return "2" }
 
 // Kind implements engine.NodeType.
 func (ImageBuild) Kind() engine.Kind { return engine.KindAction }
@@ -225,6 +227,16 @@ func (ImageBuild) RunCluster(ctx context.Context, cfg any, in engine.Inputs, clu
 	s, err := imageBuildConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("image-build: %w", err)
+	}
+	// Registry pre-check: the tag may already hold this exact build
+	// (a cleared local cache, another clone, a crashed run that pushed
+	// but never recorded) — skip the Job when an anonymous probe
+	// proves it. Any doubt builds.
+	if digest, ok := preCheckRegistry(ctx, s); ok {
+		return engine.Outputs{
+			"digest": engine.KnownValue(digest),
+			"ref":    engine.KnownValue(s.Image + "@" + digest),
+		}, nil
 	}
 	runID, err := newRunID()
 	if err != nil {
@@ -597,7 +609,11 @@ func buildContainer(s *imageBuildSpec) corev1.Container {
 	for _, k := range keys {
 		args = append(args, "--build-arg="+k+"="+s.Args[k])
 	}
+	// --label stamps the content key the registry pre-check reads
+	// back (afon.dev.build-config): same inputs as the disk cache,
+	// hex(sha256(cacheKey)), so an identical rebuild is provable.
 	args = append(args,
+		"--label="+configLabelKey+"="+s.contentKey(),
 		"--destination="+s.Image+":"+s.SHA,
 		"--digest-file="+terminationLog,
 	)

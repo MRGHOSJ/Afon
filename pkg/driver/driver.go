@@ -139,6 +139,22 @@ type ObjectLister interface {
 	ListOwned(ctx context.Context, owner Owner, kinds []ObjectKind) ([]Object, error)
 }
 
+// NamespaceEnsurer is an optional driver capability: create the
+// driver's target namespace when it does not exist. The CLI
+// type-asserts Driver to NamespaceEnsurer on apply and rollback — the
+// two commands that mutate — before any release record or object is
+// written; plan, validate, status and history never call it, keeping
+// them side-effect-free. Drivers without it (fake) manage no
+// namespaces, so the absent capability is a no-op.
+type NamespaceEnsurer interface {
+	// EnsureNamespace creates name when it is missing and returns nil
+	// when it already exists. It must never modify an existing
+	// namespace (labels are the operator's to set) and must report a
+	// forbidden create as a directive naming the manual kubectl
+	// command, not as a raw API error.
+	EnsureNamespace(ctx context.Context, name string) error
+}
+
 // ErrForeignOwner reports a desired object whose live instance carries
 // ownership for a different flow or node. Plan refuses instead of
 // adopting or clobbering it (design §4). Flow and Node are the owners

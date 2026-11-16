@@ -200,6 +200,12 @@ func (b *SecretBackend) List(ctx context.Context) ([]release.Record, error) {
 	list, err := b.dyn.Resource(secretsGVR).Namespace(b.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.Set{releaseFlowLabel: b.flow}.String(),
 	})
+	if apierrors.IsNotFound(err) {
+		// A missing namespace has no records — the fresh-cluster case.
+		// (List only 404s when the namespace itself is gone; a namespace
+		// that exists but has no matching Secrets returns an empty list.)
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("listing release records for flow %q: %w", b.flow, err)
 	}

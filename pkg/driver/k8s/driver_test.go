@@ -858,3 +858,78 @@ func TestSortDiffs(t *testing.T) {
 func contains(s, sub string) bool {
 	return strings.Contains(s, sub)
 }
+
+// --- EnsureNamespace (driver.NamespaceEnsurer) ---------------------------
+
+// A missing namespace is created plain — no labels, they are the
+// operator's to set.
+func TestEnsureNamespaceCreatesMissing(t *testing.T) {
+	d, dyn := newTestDriver(t, false, nil)
+	if err := d.EnsureNamespace(context.Background(), "brand-new"); err != nil {
+		t.Fatalf("EnsureNamespace: %v", err)
+	}
+	got, err := dyn.Resource(nsGVR).Get(context.Background(), "brand-new", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("created namespace not found: %v", err)
+	}
+	if len(got.GetLabels()) != 0 {
+		t.Errorf("created namespace labels = %v, want none (operator's to set)", got.GetLabels())
+	}
+}
+
+// An existing namespace is never modified, even one afon did not create.
+func TestEnsureNamespaceExistingUntouched(t *testing.T) {
+	seed := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1", "kind": "Namespace",
+		"metadata": map[string]any{
+			"name":   testNS,
+			"labels": map[string]any{"operator.example/owned": "yes"},
+		},
+	}}
+	d, dyn := newTestDriver(t, false, nil, seed)
+	if err := d.EnsureNamespace(context.Background(), testNS); err != nil {
+		t.Fatalf("EnsureNamespace: %v", err)
+	}
+	got, err := dyn.Resource(nsGVR).Get(context.Background(), testNS, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.GetLabels()["operator.example/owned"] != "yes" {
+		t.Errorf("existing labels = %v, want untouched", got.GetLabels())
+	}
+}
+
+// AlreadyExists from a concurrent create (our Get said missing, then
+// someone else won the race) is success, not an error.
+func TestEnsureNamespaceAlreadyExistsRace(t *testing.T) {
+	d, dyn := newTestDriver(t, false, nil)
+	dyn.PrependReactor("get", "namespaces", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "namespaces"}, "brand-new")
+	})
+	dyn.PrependReactor("create", "namespaces", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewAlreadyExists(schema.GroupResource{Resource: "namespaces"}, "brand-new")
+	})
+	if err := d.EnsureNamespace(context.Background(), "brand-new"); err != nil {
+		t.Fatalf("AlreadyExists must be success, got: %v", err)
+	}
+}
+
+// A forbidden create is a directive naming the manual kubectl command,
+// never a raw API error — and the namespace stays absent.
+func TestEnsureNamespaceForbidden(t *testing.T) {
+	d, dyn := newTestDriver(t, false, nil)
+	dyn.PrependReactor("create", "namespaces", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "namespaces"}, "",
+			fmt.Errorf("namespaces is forbidden: User \"system:anonymous\" cannot create resource \"namespaces\""))
+	})
+	err := d.EnsureNamespace(context.Background(), "brand-new")
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if !contains(err.Error(), "kubectl create namespace brand-new") {
+		t.Errorf("error %q must name the manual command", err)
+	}
+	if _, gerr := dyn.Resource(nsGVR).Get(context.Background(), "brand-new", metav1.GetOptions{}); !apierrors.IsNotFound(gerr) {
+		t.Errorf("namespace must stay absent, Get err = %v", gerr)
+	}
+}
