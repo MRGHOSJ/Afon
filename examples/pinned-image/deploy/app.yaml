@@ -1,0 +1,21 @@
+# The image below is a placeholder: at render time the flow's
+# images: {app: ...} mapping replaces it with ${image.ref}.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      containers:
+        - name: app
+          image: registry.example.com/your-org/app:0.0.0  # replaced by the flow's images: mapping
+          ports:
+            - containerPort: 8080

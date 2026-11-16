@@ -10,7 +10,7 @@ spec:
       type: app-manifests
       config:
         name: hello
-        image: nginx:1.27-alpine
+        image: registry.example.com/your-org/hello:1.0.0  # placeholder — swap in an image you can pull
         port: 8080
         out: generated.yaml
     - id: deploy

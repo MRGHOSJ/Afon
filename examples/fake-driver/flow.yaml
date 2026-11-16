@@ -1,0 +1,20 @@
+# No cluster needed: runs on the default fake driver.
+# image-ref never pulls anything — it computes a deterministic digest
+# from the ref string, so the ${image.digest} substitution path works offline.
+apiVersion: afon.dev/flow/v1
+kind: Flow
+metadata:
+  name: fake-driver
+spec:
+  nodes:
+    - id: image
+      type: image-ref
+      config:
+        ref: registry.example.com/your-org/app:1.0.0  # placeholder
+    - id: obj
+      type: fake-object
+      config:
+        kind: ConfigMap
+        name: app-digest
+        data:
+          digest: ${image.digest}

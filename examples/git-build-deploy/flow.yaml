@@ -1,0 +1,40 @@
+# Full pipeline: git repo → image build → manifests → deploy.
+# Requires a cluster: afon plan/apply --driver k8s --context <yours>
+# (image-build runs a throwaway Job in the afon-build namespace).
+#
+# Placeholders to replace:
+#   - url: your repository
+#   - image: your tagless registry path (image-build refuses tags by
+#     design; the tag is always the resolved git sha)
+#   - registrySecret: a kubernetes.io/dockerconfigjson Secret that
+#     exists in the afon-build namespace
+apiVersion: afon.dev/flow/v1
+kind: Flow
+metadata:
+  name: git-build-demo
+spec:
+  target:
+    namespace: git-build-demo
+  nodes:
+    - id: src
+      type: git-source
+      config:
+        url: https://github.com/your-org/your-repo.git  # placeholder
+        ref: main
+    - id: build
+      type: image-build
+      config:
+        image: registry.example.com/your-org/your-app  # placeholder, no tag
+        repo: ${src.url}
+        sha: ${src.sha}
+        registrySecret: registry-creds  # placeholder secret name
+    - id: web
+      type: app-manifests
+      config:
+        name: your-app
+        image: ${build.ref}  # digest-pinned reference from the build
+        port: 8080
+    - id: deploy
+      type: k8s-apply
+      config:
+        manifests: ${web.rendered}

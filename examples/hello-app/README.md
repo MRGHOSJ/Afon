@@ -1,6 +1,8 @@
 # hello-app
 
-Deploys a Deployment running `nginx:1.27-alpine` on port 8080, plus a ClusterIP Service on port 80 → 8080, from a 6-field app spec.
+Deploys a Deployment running the flow's image on port 8080, plus a ClusterIP Service on port 80 → 8080, from a 6-field app spec.
+
+The image in `flow.yaml` is a placeholder (`registry.example.com/your-org/hello:1.0.0`) — swap it for one you can pull (e.g. `nginx:1.27-alpine`) before applying.
 
 `afon render` writes `generated.yaml` (the gitignored artifact, with a provenance header); `afon plan` and `afon apply` read it as-is and never render implicitly.
 

@@ -1,0 +1,20 @@
+# Raw hand-written Kubernetes YAML: render the files, then apply.
+# Requires a cluster: afon plan/apply --driver k8s --context <yours>
+# (apply auto-creates the target namespace).
+apiVersion: afon.dev/flow/v1
+kind: Flow
+metadata:
+  name: manifests-demo
+spec:
+  target:
+    namespace: manifests-demo
+  nodes:
+    - id: manifests
+      type: k8s-manifests
+      config:
+        paths:
+          - deploy/*.yaml
+    - id: apply
+      type: k8s-apply
+      config:
+        manifests: ${manifests.rendered}

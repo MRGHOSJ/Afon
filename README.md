@@ -64,7 +64,7 @@ Afon was born out of a desire to deeply understand the internals of Kubernetes d
 
 ## Quick start
 
-Try the runnable example in [`examples/hello-app`](examples/hello-app) against a local k3d, kind or k3s cluster.
+Try the example in [`examples/hello-app`](examples/hello-app) against a local k3d, kind or k3s cluster. Its image is a placeholder — swap in one you can pull (e.g. `nginx:1.27-alpine`) first. The full gallery of placeholder-based flows (all node types) lives in [`examples/README.md`](examples/README.md).
 
 ```bash
 # 1. See what your cluster looks like (read-only)

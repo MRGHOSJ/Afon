@@ -1,0 +1,27 @@
+# Image substitution: image-ref resolves a ref + digest, and the
+# k8s-manifests images: mapping swaps the container image at render
+# time (image-ref computes a deterministic digest — it never pulls).
+# Requires a cluster: afon plan/apply --driver k8s --context <yours>
+apiVersion: afon.dev/flow/v1
+kind: Flow
+metadata:
+  name: pinned-image-demo
+spec:
+  target:
+    namespace: pinned-demo
+  nodes:
+    - id: image
+      type: image-ref
+      config:
+        ref: registry.example.com/your-org/app:1.0.0  # placeholder
+    - id: manifests
+      type: k8s-manifests
+      config:
+        paths:
+          - deploy/*.yaml
+        images:
+          app: ${image.ref}  # overwrites the container named "app"
+    - id: apply
+      type: k8s-apply
+      config:
+        manifests: ${manifests.rendered}
