@@ -21,6 +21,7 @@
 <p align="center">
   <a href="#why-afon">Why Afon</a> ·
   <a href="#status">Status</a> ·
+  <a href="docs/index.md">Docs</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#features">Features</a> ·
   <a href="#architecture">Architecture</a> ·
